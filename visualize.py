@@ -133,15 +133,84 @@ def main():
         sys.exit(1)
     x = x.to(device)
 
+    # Register a forward hook to capture latent feature maps
+    captured = {"feat": None}
+
+    def _hook_fn(_module, _inp, _out):
+        try:
+            captured["feat"] = _out.detach()
+        except Exception:
+            captured["feat"] = None
+
+    hooks = []
+    try:
+        if args.dataset == "flowers102":
+            # Prefer deeper encoder output (smaller spatial size, more semantic)
+            if hasattr(base_model, "rat") and hasattr(base_model.rat, "encoders") and len(base_model.rat.encoders) > 0:
+                hooks.append(base_model.rat.encoders[-1].register_forward_hook(_hook_fn))
+            elif hasattr(base_model, "rat") and hasattr(base_model.rat, "intro"):
+                hooks.append(base_model.rat.intro.register_forward_hook(_hook_fn))
+        else:
+            # SmallVAE: grab last encoder activation (B,128,4,4)
+            if hasattr(base_model, "enc"):
+                hooks.append(base_model.enc.register_forward_hook(_hook_fn))
+    except Exception:
+        hooks = []
+
     # Forward and reconstruct
     with torch.no_grad():
         out = lit(x)
         recon = get_recon(out).clamp(0, 1)
 
+    # Remove hooks
+    for h in hooks:
+        try:
+            h.remove()
+        except Exception:
+            pass
+
     # Optionally compute PSNR as a quick quality indicator
     mse_per_sample = F.mse_loss(recon, x, reduction="none").mean(dim=(1, 2, 3))
     psnr_per_sample = -10.0 * torch.log10(mse_per_sample + 1e-8)
     print(f"[visualize] PSNR (mean over {args.num_samples} samples): {psnr_per_sample.mean().item():.2f} dB")
+
+    # Compute latent activation heatmaps (mean/max) for the first sample
+    try:
+        feat = captured["feat"]
+        if isinstance(feat, torch.Tensor) and feat.dim() == 4 and feat.size(0) >= 1:
+            # Upsample to input spatial size
+            feat_up = F.interpolate(feat, size=x.shape[-2:], mode="bilinear", align_corners=False)
+            f0 = feat_up[0]  # (C,H,W)
+            mean_map = f0.mean(0)
+            max_map = f0.amax(0)
+
+            # Normalize to [0,1]
+            mean_map = (mean_map - mean_map.min()) / (mean_map.max() - mean_map.min() + 1e-8)
+            max_map = (max_map - max_map.min()) / (max_map.max() - max_map.min() + 1e-8)
+
+            # Build simple red-tint overlays for quick viewing
+            x0 = x[0].clamp(0, 1)
+            mean_rgb = torch.stack([mean_map, torch.zeros_like(mean_map), torch.zeros_like(mean_map)], dim=0)
+            max_rgb = torch.stack([max_map, torch.zeros_like(max_map), torch.zeros_like(max_map)], dim=0)
+
+            overlay_mean = (0.6 * x0 + 0.4 * mean_rgb).clamp(0, 1)
+            overlay_max = (0.6 * x0 + 0.4 * max_rgb).clamp(0, 1)
+
+            # Save overlays and raw maps
+            save_image(overlay_mean, os.path.join(args.output_dir, f"overlay_mean_{args.dataset}.png"))
+            save_image(overlay_max, os.path.join(args.output_dir, f"overlay_max_{args.dataset}.png"))
+
+            # Also save grayscale heatmaps as 3-channel images for convenience
+            mean_gray3 = mean_map.unsqueeze(0).repeat(3, 1, 1)
+            max_gray3 = max_map.unsqueeze(0).repeat(3, 1, 1)
+            save_image(mean_gray3, os.path.join(args.output_dir, f"heat_mean_{args.dataset}.png"))
+            save_image(max_gray3, os.path.join(args.output_dir, f"heat_max_{args.dataset}.png"))
+
+            print("[visualize] Saved latent activation heatmaps (mean/max) and overlays.")
+        else:
+            print("[visualize] Warning: Could not capture latent feature maps for heatmap visualization.")
+    except Exception as e:
+        print(f"[visualize] Heatmap generation failed: {e}")
 
     # Interleave originals and reconstructions vertically in the saved grid
     grid = torch.cat([x, recon], dim=0)
