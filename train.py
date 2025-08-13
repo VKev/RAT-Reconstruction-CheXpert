@@ -14,7 +14,7 @@ from model import SmallVAE
 from rat.Model_RAT import RAT
 from loss import make_criterion, kl_divergence
 from save import SavePredictionsCallback
-from utils import get_recon
+from utils import get_recon, generate_region_mask
 
 
 # -------------------------------
@@ -122,9 +122,9 @@ def main():
     parser.add_argument("--data-dir", type=str, default="./data")
     parser.add_argument("--dataset", type=str, default="cifar10", choices=["cifar10", "flowers102"],
                         help="Dataset name. 'cifar10' keeps 32x32; 'flowers102' is resized to 224x224")
-    parser.add_argument("--batch-size", type=int, default=1)
+    parser.add_argument("--batch-size", type=int, default=12)
     parser.add_argument("--num-workers", type=int, default=4)
-    parser.add_argument("--max-epochs", type=int, default=20)
+    parser.add_argument("--max-epochs", type=int, default=1)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--loss", type=str, default="mse", choices=["mse","l1","bce"])
     parser.add_argument("--beta", type=float, default=0.001, help="KLD weight (if available)")
@@ -167,17 +167,13 @@ def main():
         class RATWrapper(nn.Module):
             def __init__(self):
                 super().__init__()
-                self.rat = RAT(scale=1, img_channel=3, width=32, middle_blk_num=12,
+                self.rat = RAT(scale=1, img_channel=3, width=64, middle_blk_num=12,
                                 enc_blk_nums=[2, 2], dec_blk_nums=[2, 2], loss_fun=None)
 
             def forward(self, x):
                 b, _, hh, ww = x.shape
                 # Simple block mask: 14x14 grid regions over 224x224
-                grid_h, grid_w = 14, 14
-                region_ids = torch.arange(grid_h * grid_w, device=x.device).view(grid_h, grid_w)
-                mask = torch.repeat_interleave(torch.repeat_interleave(region_ids, repeats=hh // grid_h, dim=0),
-                                               repeats=ww // grid_w, dim=1)
-                mask = mask[:hh, :ww].unsqueeze(0).repeat(b, 1, 1).float()
+                mask = generate_region_mask(b, hh, ww, grid_h=14, grid_w=14, device=x.device)
                 return self.rat(x, mask)
 
         base_model = RATWrapper()

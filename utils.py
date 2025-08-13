@@ -58,7 +58,28 @@ def tensor2img(tensor, min_max=(0, 1), out_type=np.uint8):
 def img2tensor(img_arr): 
     img_tensor = torch.from_numpy(img_arr) 
     img_tensor = rearrange(img_tensor, 'h w c -> c h w') 
-    return img_tensor 
+    return img_tensor
+
+
+def generate_region_mask(batch_size, height, width, grid_h=14, grid_w=14, device='cpu'):
+    """Generate simple block region mask for image reconstruction.
+    
+    Args:
+        batch_size: Number of images in batch
+        height: Height of images
+        width: Width of images  
+        grid_h: Number of grid regions vertically (default: 14 for 224x224 images)
+        grid_w: Number of grid regions horizontally (default: 14 for 224x224 images)
+        device: Device to create tensor on
+        
+    Returns:
+        mask: Float tensor of shape [batch_size, height, width] with region IDs
+    """
+    region_ids = torch.arange(grid_h * grid_w, device=device).view(grid_h, grid_w)
+    mask = torch.repeat_interleave(torch.repeat_interleave(region_ids, repeats=height // grid_h, dim=0),
+                                   repeats=width // grid_w, dim=1)
+    mask = mask[:height, :width].unsqueeze(0).repeat(batch_size, 1, 1).float()
+    return mask 
 
 def calculate_psnr(img1, img2, crop_border, input_order='HWC', test_y_channel=True):
     """Calculate PSNR (Peak Signal-to-Noise Ratio).

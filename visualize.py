@@ -2,16 +2,17 @@
 # -*- coding: utf-8 -*-
 
 """
-Visualize reconstructions after training.
+Visualize reconstructions after training with RAT model for flowers102 dataset.
 
 Usage examples:
-  # Auto-find latest best checkpoint
-  python visualize.py --num-samples 2
+  # Auto-find latest best checkpoint for flowers102
+  python visualize.py --dataset flowers102 --num-samples 2
 
   # Explicit checkpoint path
-  python visualize.py --ckpt-path outputs/lightning_logs/version_0/checkpoints/best-00.ckpt
+  python visualize.py --dataset flowers102 --ckpt-path outputs/lightning_logs/version_0/checkpoints/best-00.ckpt
 
-  # Optionally point to a specific checkpoint
+  # CIFAR-10 with SmallVAE (legacy)
+  python visualize.py --dataset cifar10 --num-samples 2
 """
 
 import argparse
@@ -29,8 +30,10 @@ from torchvision.utils import save_image
 
 # Reuse helpers and LightningModule from train.py
 from train import LitAutoModule
-from utils import get_recon
+from utils import get_recon, generate_region_mask
 from model import SmallVAE
+from rat.Model_RAT import RAT
+from datamodule import ImageDataModule
 
 
 def find_latest_best_ckpt(root_dir: str = "outputs") -> Optional[str]:
@@ -46,15 +49,35 @@ def find_latest_best_ckpt(root_dir: str = "outputs") -> Optional[str]:
     return candidates[0]
 
 
-def build_base_model() -> nn.Module:
-    return SmallVAE(latent_dim=128)
+def build_base_model(dataset: str) -> nn.Module:
+    """Build the appropriate model based on dataset."""
+    if dataset == "flowers102":
+        # RAT wrapper for flowers102 (224x224x3)
+        class RATWrapper(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.rat = RAT(scale=1, img_channel=3, width=64, middle_blk_num=12,
+                                enc_blk_nums=[2, 2], dec_blk_nums=[2, 2], loss_fun=None)
+
+            def forward(self, x):
+                b, _, hh, ww = x.shape
+                # Simple block mask: 14x14 grid regions over 224x224
+                mask = generate_region_mask(b, hh, ww, grid_h=14, grid_w=14, device=x.device)
+                return self.rat(x, mask)
+        
+        return RATWrapper()
+    else:
+        # SmallVAE for CIFAR-10 (32x32x3)
+        return SmallVAE(latent_dim=128)
 
 
 def main():
     parser = argparse.ArgumentParser(description="Visualize reconstructions from a trained checkpoint")
     parser.add_argument("--ckpt-path", type=str, default=None, help="Path to .ckpt (if omitted, auto-detect latest best)")
 
-    # Model: always use SmallVAE from model.py
+    # Dataset and model selection
+    parser.add_argument("--dataset", type=str, default="flowers102", choices=["cifar10", "flowers102"],
+                        help="Dataset name. 'cifar10' uses SmallVAE; 'flowers102' uses RAT")
 
     # Data / output
     parser.add_argument("--data-dir", type=str, default="./data")
@@ -85,19 +108,22 @@ def main():
     print(f"[visualize] Using checkpoint: {ckpt_path}")
 
     # Build base model and Lightning module, then load weights
-    base_model = build_base_model()
+    base_model = build_base_model(args.dataset)
 
     lit: LitAutoModule = LitAutoModule.load_from_checkpoint(ckpt_path, model=base_model, map_location=device)
     lit.eval()
     lit.to(device)
 
-    # Prepare a tiny train sampler from CIFAR10
-    transform = T.Compose([T.ToTensor()])
-    train_set = torchvision.datasets.CIFAR10(args.data_dir, train=True, transform=transform, download=True)
+    # Prepare dataset using DataModule (same as training)
+    dm = ImageDataModule(data_dir=args.data_dir, batch_size=args.num_samples, num_workers=0,
+                         dataset=args.dataset)
+    dm.prepare_data()
+    dm.setup("test")  # Use test set for visualization
+    
     if args.num_samples <= 0:
         print("[visualize] --num-samples must be >= 1")
         sys.exit(1)
-    loader = torch.utils.data.DataLoader(train_set, batch_size=args.num_samples, shuffle=True)
+    loader = dm.test_dataloader()
 
     # Fetch a single batch
     try:
@@ -119,8 +145,11 @@ def main():
 
     # Interleave originals and reconstructions vertically in the saved grid
     grid = torch.cat([x, recon], dim=0)
-    save_path = os.path.join(args.output_dir, "recon_grid.png")
+    save_path = os.path.join(args.output_dir, f"recon_grid_{args.dataset}.png")
     save_image(grid, save_path, nrow=args.num_samples, padding=2)
+    print(f"[visualize] Dataset: {args.dataset}")
+    print(f"[visualize] Model: {'RAT' if args.dataset == 'flowers102' else 'SmallVAE'}")
+    print(f"[visualize] Image size: {x.shape[-2:]} x {x.shape[1]} channels")
     print(f"[visualize] Saved visualization to: {save_path}")
 
 
