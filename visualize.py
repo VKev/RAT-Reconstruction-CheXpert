@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 """
-Visualize reconstructions after training with RAT model for flowers102 dataset.
+Visualize reconstructions after training.
 
 Usage examples:
   # Auto-find latest best checkpoint for flowers102
@@ -13,6 +13,15 @@ Usage examples:
 
   # CIFAR-10 with SmallVAE (legacy)
   python visualize.py --dataset cifar10 --num-samples 2
+
+  # CheXpert (uses train split only; honors --limit-train-batches)
+  python visualize.py --dataset chexpert --num-samples 2 --limit-train-batches 0.0005 \
+      --chexpert-train-csv C:\path\to\train.csv \
+      --chexpert-val-csv C:\path\to\valid.csv \
+      --chexpert-test-csv C:\path\to\test_labels.csv \
+      --chexpert-train-root C:\path\to\chexpert \
+      --chexpert-valid-root C:\path\to\chexpert \
+      --chexpert-test-root C:\path\to\chexpert
 """
 
 import argparse
@@ -20,6 +29,8 @@ import os
 import sys
 from glob import glob
 from typing import Optional
+import math
+from itertools import islice
 
 import torch
 import torch.nn as nn
@@ -51,7 +62,7 @@ def find_latest_best_ckpt(root_dir: str = "outputs") -> Optional[str]:
 
 def build_base_model(dataset: str) -> nn.Module:
     """Build the appropriate model based on dataset."""
-    if dataset == "flowers102":
+    if dataset in ("flowers102", "chexpert"):
         # RAT wrapper for flowers102 (224x224x3)
         class RATWrapper(nn.Module):
             def __init__(self):
@@ -76,14 +87,34 @@ def main():
     parser.add_argument("--ckpt-path", type=str, default=None, help="Path to .ckpt (if omitted, auto-detect latest best)")
 
     # Dataset and model selection
-    parser.add_argument("--dataset", type=str, default="flowers102", choices=["cifar10", "flowers102"],
-                        help="Dataset name. 'cifar10' uses SmallVAE; 'flowers102' uses RAT")
+    parser.add_argument("--dataset", type=str, default="flowers102", choices=["cifar10", "flowers102", "chexpert"],
+                        help="Dataset name. 'cifar10' uses SmallVAE; 'flowers102' and 'chexpert' use RAT")
 
     # Data / output
     parser.add_argument("--data-dir", type=str, default="./data")
     parser.add_argument("--num-samples", type=int, default=2)
     parser.add_argument("--output-dir", type=str, default="outputs/visualize")
     parser.add_argument("--seed", type=int, default=42)
+
+    # CheXpert-specific options (defaults mirror training script for convenience)
+    parser.add_argument("--chexpert-train-csv", type=str, default=r"C:\Vkev\Repos\Region-Attention-Transformer-for-Medical-Image-Restoration\data\archive\train.csv",
+                        help="Path to CheXpert training CSV (with 'Path' column)")
+    parser.add_argument("--chexpert-val-csv", type=str, default=r"C:\Vkev\Repos\Region-Attention-Transformer-for-Medical-Image-Restoration\data\archive\valid.csv",
+                        help="Path to CheXpert validation CSV (with 'Path' column)")
+    parser.add_argument("--chexpert-test-csv", type=str, default=r"C:\Vkev\Repos\Region-Attention-Transformer-for-Medical-Image-Restoration\data\ChetXpert_Test\content\chexlocalize\chexlocalize\CheXpert\test_labels.csv",
+                        help="Path to CheXpert test CSV (with 'Path' column)")
+    parser.add_argument("--chexpert-root", type=str, default=None,
+                        help="Generic root dir for CheXpert (optional if split roots are provided)")
+    parser.add_argument("--chexpert-train-root", type=str, default=r"C:\Vkev\Repos\Region-Attention-Transformer-for-Medical-Image-Restoration\data\archive",
+                        help="Override root for train split (joined as <root>/train/<suffix> if needed)")
+    parser.add_argument("--chexpert-valid-root", type=str, default=r"C:\Vkev\Repos\Region-Attention-Transformer-for-Medical-Image-Restoration\data\archive",
+                        help="Override root for valid split (joined as <root>/valid/<suffix> if needed)")
+    parser.add_argument("--chexpert-test-root", type=str, default=r"C:\Vkev\Repos\Region-Attention-Transformer-for-Medical-Image-Restoration\data\ChetXpert_Test\content\chexlocalize\chexlocalize\CheXpert",
+                        help="Override root for test split (joined as <root>/test/<suffix> if needed)")
+    parser.add_argument("--chexpert-policy", type=str, default="ones", choices=["ones", "zeroes"],
+                        help="How to map uncertain labels (-1): 'ones' or 'zeroes'")
+    parser.add_argument("--limit-train-batches", type=float, default=0.0005,
+                        help="Fraction of train DataLoader to consider (used for chexpert visualization)")
 
     args = parser.parse_args()
 
@@ -115,21 +146,49 @@ def main():
     lit.to(device)
 
     # Prepare dataset using DataModule (same as training)
-    dm = ImageDataModule(data_dir=args.data_dir, batch_size=args.num_samples, num_workers=0,
-                         dataset=args.dataset)
+    dm = ImageDataModule(
+        data_dir=args.data_dir,
+        batch_size=args.num_samples,
+        num_workers=0,
+        dataset=args.dataset,
+        chexpert_train_csv=args.chexpert_train_csv,
+        chexpert_val_csv=args.chexpert_val_csv,
+        chexpert_test_csv=args.chexpert_test_csv,
+        chexpert_root=args.chexpert_root,
+        chexpert_train_root=args.chexpert_train_root,
+        chexpert_valid_root=args.chexpert_valid_root,
+        chexpert_test_root=args.chexpert_test_root,
+        
+    )
     dm.prepare_data()
-    dm.setup("test")  # Use test set for visualization
-    
+
+    # Choose loader: chexpert -> train split only; others -> test split
+    if args.dataset == "chexpert":
+        dm.setup("fit")
+        loader = dm.train_dataloader()
+        # Respect limit-train-batches: pick a batch within the first allowed fraction
+        total_batches = len(loader) if hasattr(loader, "__len__") else None
+        allowed = 1
+        if total_batches is not None and total_batches > 0:
+            allowed = max(1, int(math.ceil(total_batches * max(0.0, min(1.0, args.limit_train_batches)))))
+        # Select the last batch within the allowed window for better coverage
+        try:
+            x, _ = next(islice(iter(loader), allowed - 1, allowed))
+        except StopIteration:
+            print("[visualize] Empty training loader for chexpert.")
+            sys.exit(1)
+    else:
+        dm.setup("test")
+        loader = dm.test_dataloader()
+        # Fetch a single batch
+        try:
+            x, _ = next(iter(loader))
+        except StopIteration:
+            print("[visualize] Empty dataset.")
+            sys.exit(1)
+
     if args.num_samples <= 0:
         print("[visualize] --num-samples must be >= 1")
-        sys.exit(1)
-    loader = dm.test_dataloader()
-
-    # Fetch a single batch
-    try:
-        x, _ = next(iter(loader))
-    except StopIteration:
-        print("[visualize] Empty dataset.")
         sys.exit(1)
     x = x.to(device)
 
@@ -144,7 +203,7 @@ def main():
 
     hooks = []
     try:
-        if args.dataset == "flowers102":
+        if args.dataset in ("flowers102", "chexpert"):
             # Prefer deeper encoder output (smaller spatial size, more semantic)
             if hasattr(base_model, "rat") and hasattr(base_model.rat, "encoders") and len(base_model.rat.encoders) > 0:
                 hooks.append(base_model.rat.encoders[-1].register_forward_hook(_hook_fn))

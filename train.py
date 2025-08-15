@@ -12,7 +12,7 @@ from lightning.pytorch.callbacks import ModelCheckpoint, LearningRateMonitor, TQ
 from datamodule import ImageDataModule
 from model import SmallVAE
 from rat.Model_RAT import RAT
-from loss import make_criterion, kl_divergence
+from loss import make_criterion, kl_divergence, FocalRegionLoss
 from save import SavePredictionsCallback
 from utils import get_recon, generate_region_mask
 
@@ -50,7 +50,13 @@ class LitAutoModule(L.LightningModule):
 
     def _compute_loss(self, x, out) -> torch.Tensor:
         recon = get_recon(out)
-        rec = self.crit(recon, x)
+        # If using FocalRegionLoss (RAT), require a region mask at input resolution
+        if isinstance(self.crit, FocalRegionLoss):
+            b, _, hh, ww = x.shape
+            mask = generate_region_mask(b, hh, ww, grid_h=14, grid_w=14, device=x.device)
+            rec = self.crit(recon, x, mask)
+        else:
+            rec = self.crit(recon, x)
         total = rec
 
         # Add KL term if (mu, logvar) are provided by the model
@@ -115,29 +121,48 @@ def parse_devices(dev_str: str) -> Union[str, int, list]:
     return "auto"
 
 def main():
-    parser = argparse.ArgumentParser(description="Training (Lightning) with CIFAR-10 or Caltech101")
+    parser = argparse.ArgumentParser(description="Training (Lightning) with CIFAR-10, Flowers102, or CheXpert")
     # Model: always use SmallVAE from model.py
 
     # Training options
     parser.add_argument("--data-dir", type=str, default="./data")
-    parser.add_argument("--dataset", type=str, default="cifar10", choices=["cifar10", "flowers102"],
-                        help="Dataset name. 'cifar10' keeps 32x32; 'flowers102' is resized to 224x224")
+    parser.add_argument("--dataset", type=str, default="cifar10", choices=["cifar10", "flowers102", "chexpert"],
+                        help="Dataset name. 'cifar10' keeps 32x32; 'flowers102' and 'chexpert' are resized to 224x224")
     parser.add_argument("--batch-size", type=int, default=12)
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--max-epochs", type=int, default=1)
     parser.add_argument("--lr", type=float, default=1e-3)
-    parser.add_argument("--loss", type=str, default="mse", choices=["mse","l1","bce"])
+    parser.add_argument("--loss", type=str, default="mse", choices=["mse","l1","bce","focal"],
+                        help="Loss function. Use 'focal' for RAT on flowers102 to enable FocalRegionLoss")
     parser.add_argument("--beta", type=float, default=0.001, help="KLD weight (if available)")
     parser.add_argument("--add-kld-if-available", action="store_true", help="Add KL term if model returns (mu, logvar)")
     parser.add_argument("--seed", type=int, default=42)
+
+    # CheXpert-specific options
+    parser.add_argument("--chexpert-train-csv", type=str, default=r"C:\Vkev\Repos\Region-Attention-Transformer-for-Medical-Image-Restoration\data\archive\train.csv",
+                        help="Path to CheXpert training CSV (with 'Path' column)")
+    parser.add_argument("--chexpert-val-csv", type=str, default=r"C:\Vkev\Repos\Region-Attention-Transformer-for-Medical-Image-Restoration\data\archive\valid.csv",
+                        help="Path to CheXpert validation CSV (with 'Path' column)")
+    parser.add_argument("--chexpert-test-csv", type=str, default=r"C:\Vkev\Repos\Region-Attention-Transformer-for-Medical-Image-Restoration\data\ChetXpert_Test\content\chexlocalize\chexlocalize\CheXpert\test_labels.csv",
+                        help="Path to CheXpert test CSV (with 'Path' column)")
+    parser.add_argument("--chexpert-root", type=str, default=None,
+                        help="Root directory to resolve image paths from the CSV (optional if CSV has absolute paths)")
+    parser.add_argument("--chexpert-train-root", type=str, default=r"C:\Vkev\Repos\Region-Attention-Transformer-for-Medical-Image-Restoration\data\archive",
+                        help="Override root for train split (joined as <root>/train/<suffix> if needed)")
+    parser.add_argument("--chexpert-valid-root", type=str, default=r"C:\Vkev\Repos\Region-Attention-Transformer-for-Medical-Image-Restoration\data\archive",
+                        help="Override root for valid split (joined as <root>/valid/<suffix> if needed)")
+    parser.add_argument("--chexpert-test-root", type=str, default=r"C:\Vkev\Repos\Region-Attention-Transformer-for-Medical-Image-Restoration\data\ChetXpert_Test\content\chexlocalize\chexlocalize\CheXpert",
+                        help="Override root for test split (joined as <root>/test/<suffix> if needed)")
+    parser.add_argument("--chexpert-policy", type=str, default="ones", choices=["ones", "zeroes"],
+                        help="How to map uncertain labels (-1): 'ones' or 'zeroes'")
 
     # Trainer options
     parser.add_argument("--devices", type=str, default="auto", help="'auto', an int like '1', or list '0,1'")
     parser.add_argument("--precision", type=str, default="32-true", help="e.g., 32-true, 16-mixed, bf16-mixed")
     parser.add_argument("--accumulate-grad-batches", type=int, default=1)
     parser.add_argument("--log-every-n-steps", type=int, default=50)
-    parser.add_argument("--limit-train-batches", type=float, default=1.0)
-    parser.add_argument("--limit-val-batches", type=float, default=1.0)
+    parser.add_argument("--limit-train-batches", type=float, default=0.0005)
+    parser.add_argument("--limit-val-batches", type=float, default=0.01)
     parser.add_argument("--ckpt-path", type=str, default=None, help="Resume from checkpoint path")
     parser.add_argument("--output-dir", type=str, default="outputs")
     parser.add_argument("--save-samples", action="store_true", help="Save sample reconstructions each val epoch")
@@ -151,8 +176,20 @@ def main():
     except Exception:
         pass
     L.seed_everything(args.seed, workers=True)
-    dm = ImageDataModule(data_dir=args.data_dir, batch_size=args.batch_size, num_workers=args.num_workers,
-                         dataset=args.dataset)
+    dm = ImageDataModule(
+        data_dir=args.data_dir,
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
+        dataset=args.dataset,
+        chexpert_train_csv=args.chexpert_train_csv,
+        chexpert_val_csv=args.chexpert_val_csv,
+        chexpert_test_csv=args.chexpert_test_csv,
+        chexpert_root=args.chexpert_root,
+        chexpert_train_root=args.chexpert_train_root,
+        chexpert_valid_root=args.chexpert_valid_root,
+        chexpert_test_root=args.chexpert_test_root,
+        chexpert_policy=args.chexpert_policy,
+    )
     dm.prepare_data()
     dm.setup("fit")
 
