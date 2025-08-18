@@ -134,6 +134,40 @@ def main():
         print("[gen_masks] CUDA requested but not available. Falling back to CPU.")
     predictor = build_sam_predictor(args.sam_checkpoint, args.sam_model_type, device=use_device)
 
+    # Resume/autosave state for single-file JSONL
+    import json
+    single_file_path = os.path.join(args.output_dir, "chexpert_masks.jsonl") if args.single_file else None
+    existing_paths = set()
+    if args.single_file and os.path.exists(single_file_path):
+        try:
+            with open(single_file_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    try:
+                        rec = json.loads(line)
+                        p = rec.get("path")
+                        if isinstance(p, str):
+                            existing_paths.add(p)
+                    except Exception:
+                        continue
+            print(f"[resume] Loaded {len(existing_paths)} existing entries from {single_file_path}")
+        except Exception as e:
+            print(f"[resume] Failed to load existing JSONL: {e}")
+    pending_records = []  # records queued for append
+
+    def flush_pending():
+        if not args.single_file or not pending_records:
+            return
+        os.makedirs(args.output_dir, exist_ok=True)
+        try:
+            with open(single_file_path, "a", encoding="utf-8") as f:
+                for rec in pending_records:
+                    f.write(json.dumps(rec) + "\n")
+            print(f"[autosave] Appended {len(pending_records)} records to {single_file_path}")
+        except Exception as e:
+            print(f"[autosave] Failed to append records: {e}")
+        finally:
+            pending_records.clear()
+
     dm = ImageDataModule(
         dataset=args.dataset,
         batch_size=1,
@@ -151,91 +185,119 @@ def main():
     )
     dm.prepare_data()
 
-    import json
-    all_masks = [] if args.single_file else None
+    all_masks = [] if (args.single_file and False) else None  # deprecated collector when resume is on
     viz_candidates = []  # list of tuples: (norm_rel_path, split, abs_path)
 
-    for split in ["fit", "validate", "test"]:
-        try:
-            # Clear GPU cache before switching datasets
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-            
-            dm.setup(split if split != "fit" else "fit")
-            if split == "fit":
-                dataset = dm.train_set
-            elif split == "validate":
-                dataset = dm.val_set
-            else:
-                dataset = dm.test_set
-        except Exception:
-            continue
-
-        total = len(dataset)
-        if split == "fit":
-            frac = max(0.0, min(1.0, float(args.limit_train_fraction)))
-        elif split == "validate":
-            frac = max(0.0, min(1.0, float(args.limit_val_fraction)))
-        else:
-            frac = max(0.0, min(1.0, float(args.limit_test_fraction)))
-        limit_n = max(0, int(total * frac)) if frac < 1.0 else total
-        if limit_n == 0:
-            continue
-        for idx in tqdm(range(limit_n), desc=f"SAM masks {split} ({limit_n}/{total})"):
+    try:
+        for split in ["fit", "validate", "test"]:
             try:
-                # Access path resolution as in dataset
-                rel_path = dataset.rel_paths[idx]
-                abs_path = dataset._resolve_path(rel_path)
-                mask = predict_mask_for_image(predictor, abs_path, target_size=args.target_size)
-                # save as pt mirroring split/relative path
-                norm = rel_path.replace("\\", "/")
-                # Keep only the part starting from the split folder (train/|valid/|test/)
-                found_marker = False
-                for marker in ["train/", "valid/", "test/"]:
-                    pos = norm.find(marker)
-                    if pos != -1:
-                        norm = norm[pos:]
-                        found_marker = True
-                        break
-                if not found_marker:
-                    # fallback: prefix based on current split
-                    if split == "fit":
-                        norm = "train/" + norm
-                    elif split == "validate":
-                        norm = "valid/" + norm
-                    else:
-                        norm = "test/" + norm
-                if args.single_file:
-                    # Save multi-class mask directly (not binary)
-                    mask_np = mask.cpu().numpy().astype("uint16")  # support up to 65k classes
-                    rec = {"path": norm, "mask": mask_np.tolist()}  # store as nested list
-                    all_masks.append(rec)
+                # Clear GPU cache before switching datasets
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                
+                dm.setup(split if split != "fit" else "fit")
+                if split == "fit":
+                    dataset = dm.train_set
+                elif split == "validate":
+                    dataset = dm.val_set
                 else:
-                    if args.jsonl:
-                        mask_bin = (mask > 0).to(torch.uint8).cpu().numpy()
-                        rec = {"path": norm, "rle": rle_encode_binary(mask_bin)}
-                        out_path = os.path.join(args.output_dir, os.path.splitext(norm)[0] + ".jsonl")
-                        os.makedirs(os.path.dirname(out_path), exist_ok=True)
-                        with open(out_path, "a", encoding="utf-8") as f:
-                            f.write(json.dumps(rec) + "\n")
-                    else:
-                        out_path = os.path.join(args.output_dir, os.path.splitext(norm)[0] + ".pt")
-                        save_mask_tensor(mask, out_path)
-
-                # collect candidates for later visualization
-                if args.viz and len(viz_candidates) < max(1, int(args.viz_num_samples)):
-                    viz_candidates.append((norm, split, abs_path))
+                    dataset = dm.test_set
             except Exception:
                 continue
 
+            total = len(dataset)
+            if split == "fit":
+                frac = max(0.0, min(1.0, float(args.limit_train_fraction)))
+            elif split == "validate":
+                frac = max(0.0, min(1.0, float(args.limit_val_fraction)))
+            else:
+                frac = max(0.0, min(1.0, float(args.limit_test_fraction)))
+            limit_n = max(0, int(total * frac)) if frac < 1.0 else total
+            if limit_n == 0:
+                continue
+
+            interval = max(1, int(limit_n * 0.1))  # autosave every 10%
+
+            for idx in tqdm(range(limit_n), desc=f"SAM masks {split} ({limit_n}/{total})"):
+                try:
+                    # Access path resolution as in dataset
+                    rel_path = dataset.rel_paths[idx]
+                    abs_path = dataset._resolve_path(rel_path)
+                    # save as pt mirroring split/relative path
+                    norm = rel_path.replace("\\", "/")
+                    # Keep only the part starting from the split folder (train/|valid/|test/)
+                    found_marker = False
+                    for marker in ["train/", "valid/", "test/"]:
+                        pos = norm.find(marker)
+                        if pos != -1:
+                            norm = norm[pos:]
+                            found_marker = True
+                            break
+                    if not found_marker:
+                        # fallback: prefix based on current split
+                        if split == "fit":
+                            norm = "train/" + norm
+                        elif split == "validate":
+                            norm = "valid/" + norm
+                        else:
+                            norm = "test/" + norm
+
+                    # Resume skipping logic
+                    if args.single_file:
+                        if norm in existing_paths:
+                            continue
+                    else:
+                        if args.jsonl:
+                            out_path = os.path.join(args.output_dir, os.path.splitext(norm)[0] + ".jsonl")
+                            if os.path.exists(out_path):
+                                continue
+                        else:
+                            out_path = os.path.join(args.output_dir, os.path.splitext(norm)[0] + ".pt")
+                            if os.path.exists(out_path):
+                                continue
+
+                    mask = predict_mask_for_image(predictor, abs_path, target_size=args.target_size)
+
+                    if args.single_file:
+                        # Save multi-class mask directly (not binary) into pending buffer
+                        mask_np = mask.cpu().numpy().astype("uint16")
+                        rec = {"path": norm, "mask": mask_np.tolist()}
+                        pending_records.append(rec)
+                        existing_paths.add(norm)
+                        # autosave by 10%
+                        if ((idx + 1) % interval) == 0:
+                            flush_pending()
+                    else:
+                        if args.jsonl:
+                            mask_bin = (mask > 0).to(torch.uint8).cpu().numpy()
+                            rec = {"path": norm, "rle": rle_encode_binary(mask_bin)}
+                            out_path = os.path.join(args.output_dir, os.path.splitext(norm)[0] + ".jsonl")
+                            os.makedirs(os.path.dirname(out_path), exist_ok=True)
+                            with open(out_path, "a", encoding="utf-8") as f:
+                                f.write(json.dumps(rec) + "\n")
+                        else:
+                            out_path = os.path.join(args.output_dir, os.path.splitext(norm)[0] + ".pt")
+                            save_mask_tensor(mask, out_path)
+
+                    # collect candidates for later visualization
+                    if args.viz and len(viz_candidates) < max(1, int(args.viz_num_samples)):
+                        viz_candidates.append((norm, split, abs_path))
+                except Exception:
+                    continue
+
+            # flush end of split
+            flush_pending()
+    except KeyboardInterrupt:
+        # ensure pending data are saved
+        flush_pending()
+        print("[resume] Caught KeyboardInterrupt. Saved pending records. Exiting early.")
+        return
+
     if args.single_file:
-        # Save one JSONL file
-        os.makedirs(args.output_dir, exist_ok=True)
-        out_file = os.path.join(args.output_dir, "chexpert_masks.jsonl")
-        with open(out_file, "w", encoding="utf-8") as f:
-            for rec in all_masks:
-                f.write(json.dumps(rec) + "\n")
-        print(f"[gen_masks] Saved {len(all_masks)} masks to {out_file}")
+        # Ensure any remaining records are flushed
+        flush_pending()
+        if single_file_path and os.path.exists(single_file_path):
+            print(f"[gen_masks] Saved masks to {single_file_path}")
         
         # Visualize a few samples from the saved JSONL to verify multi-class masks
         if args.viz and len(all_masks) > 0:
