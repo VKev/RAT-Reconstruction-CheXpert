@@ -36,7 +36,8 @@ from utils import get_recon, generate_region_mask
 class LitAutoModule(L.LightningModule):
     def __init__(self, model: nn.Module, lr: float = 1e-3, loss: str = "mse",
                  add_kld_if_available: bool = True, beta: float = 0.001,
-                 input_noise_std: float = 0.0):
+                 input_noise_std: float = 0.0,
+                 use_default_grid_mask: bool = True, grid_h: int = 14, grid_w: int = 14):
         super().__init__()
         self.model = model
         self.save_hyperparameters(ignore=["model"])
@@ -52,13 +53,19 @@ class LitAutoModule(L.LightningModule):
         except TypeError:
             return self.model(x)
 
-    def _compute_loss(self, x, out) -> torch.Tensor:
+    def _compute_loss(self, x, out, mask_for_loss: torch.Tensor | None = None) -> torch.Tensor:
         recon = get_recon(out)
         # If using FocalRegionLoss (RAT), require a region mask at input resolution
         if isinstance(self.crit, FocalRegionLoss):
-            b, _, hh, ww = x.shape
-            mask = generate_region_mask(b, hh, ww, grid_h=14, grid_w=14, device=x.device)
-            rec = self.crit(recon, x, mask)
+            if mask_for_loss is None and bool(getattr(self.hparams, "use_default_grid_mask", True)):
+                b, _, hh, ww = x.shape
+                mask_for_loss = generate_region_mask(
+                    b, hh, ww,
+                    grid_h=int(getattr(self.hparams, "grid_h", 14)),
+                    grid_w=int(getattr(self.hparams, "grid_w", 14)),
+                    device=x.device,
+                )
+            rec = self.crit(recon, x, mask_for_loss)
         else:
             rec = self.crit(recon, x)
         total = rec
@@ -90,28 +97,50 @@ class LitAutoModule(L.LightningModule):
         if noise_std > 0.0:
             noise = torch.randn_like(x) * noise_std
             x_in = (x + noise).clamp(0, 1)
+        # Choose mask strategy
         mask = None
-        try:
-            if torch.is_tensor(y) and y.dim() >= 2:
-                mask = y
-        except Exception:
-            mask = None
+        use_default = bool(getattr(self.hparams, "use_default_grid_mask", True))
+        if use_default:
+            b, _, hh, ww = x_in.shape
+            mask = generate_region_mask(
+                b, hh, ww,
+                grid_h=int(getattr(self.hparams, "grid_h", 14)),
+                grid_w=int(getattr(self.hparams, "grid_w", 14)),
+                device=x_in.device,
+            )
+        else:
+            try:
+                if torch.is_tensor(y) and y.dim() >= 2:
+                    mask = y
+            except Exception:
+                mask = None
         out = self(x_in, mask=mask)
-        loss = self._compute_loss(x, out)
+        loss = self._compute_loss(x, out, mask_for_loss=mask)
         self.log("loss/train", loss, prog_bar=True, on_step=True, on_epoch=True)
         return loss
 
     def validation_step(self, batch, batch_idx):
         x, y = batch
         with torch.no_grad():
+            # Choose mask strategy
             mask = None
-            try:
-                if torch.is_tensor(y) and y.dim() >= 2:
-                    mask = y
-            except Exception:
-                mask = None
+            use_default = bool(getattr(self.hparams, "use_default_grid_mask", True))
+            if use_default:
+                b, _, hh, ww = x.shape
+                mask = generate_region_mask(
+                    b, hh, ww,
+                    grid_h=int(getattr(self.hparams, "grid_h", 14)),
+                    grid_w=int(getattr(self.hparams, "grid_w", 14)),
+                    device=x.device,
+                )
+            else:
+                try:
+                    if torch.is_tensor(y) and y.dim() >= 2:
+                        mask = y
+                except Exception:
+                    mask = None
             out = self(x, mask=mask)
-        loss = self._compute_loss(x, out)
+        loss = self._compute_loss(x, out, mask_for_loss=mask)
         self.log("loss/val", loss, prog_bar=True, on_step=False, on_epoch=True)
 
         # PSNR for a quick quality signal (assuming outputs are in [0,1])
@@ -164,6 +193,10 @@ def main():
     # RAT hyperparameters (declare upfront to avoid unrecognized args)
     parser.add_argument("--rat-width", type=int, default=64, help="Base channel width for RAT")
     parser.add_argument("--rat-skip-strength", type=float, default=1.0, help="Strength multiplier for decoder skip connections (0 disables skips)")
+    # Default mask options
+    parser.add_argument("--use-default-grid-mask", action="store_true", help="Use default 14x14 region mask for training/validation")
+    parser.add_argument("--grid-h", type=int, default=14, help="Grid height for default region mask")
+    parser.add_argument("--grid-w", type=int, default=14, help="Grid width for default region mask")
     parser.add_argument("--seed", type=int, default=42)
 
     # CheXpert-specific options
@@ -280,6 +313,9 @@ def main():
         add_kld_if_available=args.add_kld_if_available,
         beta=args.beta,
         input_noise_std=args.input_noise_std,
+        use_default_grid_mask=args.use_default_grid_mask,
+        grid_h=args.grid_h,
+        grid_w=args.grid_w,
     )
     # Align example input shape with dataset
     try:

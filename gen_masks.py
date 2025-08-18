@@ -98,9 +98,6 @@ def main():
     parser.add_argument("--sam-model-type", type=str, default="vit_b", choices=["vit_b","vit_l","vit_h"], help="SAM model type")
     parser.add_argument("--device", type=str, default="cuda", choices=["cuda","cpu"], help="Device for SAM inference")
     parser.add_argument("--target-size", type=int, default=224, help="Resize input image to this square size before SAM (e.g., 224)")
-    parser.add_argument("--batch-size", type=int, default=1, help="Batch size for datamodule/dataloader (SAM inference remains per-image)")
-    parser.add_argument("--num-workers", type=int, default=0, help="Number of DataLoader workers for datamodule")
-    parser.add_argument("--concurrency", type=int, default=1, help="Parallel SAM workers per GPU (duplicates model per worker; requires free VRAM)")
     # CheXpert paths
     parser.add_argument("--chexpert-train-csv", type=str, default=r"C:\Vkev\Repos\Region-Attention-Transformer-for-Medical-Image-Restoration\data\archive\train.csv",
                         help="Path to CheXpert training CSV (with 'Path' column)")
@@ -155,7 +152,7 @@ def main():
             print(f"[resume] Loaded {len(existing_paths)} existing entries from {single_file_path}")
         except Exception as e:
             print(f"[resume] Failed to load existing JSONL: {e}")
-    pending_records = []  # records queued for append (sequential path)
+    pending_records = []  # records queued for append
 
     def flush_pending():
         if not args.single_file or not pending_records:
@@ -173,8 +170,8 @@ def main():
 
     dm = ImageDataModule(
         dataset=args.dataset,
-        batch_size=args.batch_size,
-        num_workers=args.num_workers,
+        batch_size=1,
+        num_workers=0,
         chexpert_train_csv=args.chexpert_train_csv,
         chexpert_val_csv=args.chexpert_val_csv,
         chexpert_test_csv=args.chexpert_test_csv,
@@ -190,20 +187,6 @@ def main():
 
     all_masks = [] if (args.single_file and False) else None  # deprecated collector when resume is on
     viz_candidates = []  # list of tuples: (norm_rel_path, split, abs_path)
-
-    import threading
-    from concurrent.futures import ThreadPoolExecutor, as_completed
-    writer_lock = threading.Lock()
-    viz_lock = threading.Lock()
-    thread_local = threading.local()
-    use_threads = max(1, int(args.concurrency)) > 1 and args.device == "cuda"
-
-    def get_thread_predictor():
-        p = getattr(thread_local, "predictor", None)
-        if p is None:
-            p = build_sam_predictor(args.sam_checkpoint, args.sam_model_type, device=use_device)
-            thread_local.predictor = p
-        return p
 
     try:
         for split in ["fit", "validate", "test"]:
@@ -233,98 +216,77 @@ def main():
             if limit_n == 0:
                 continue
 
-            interval = max(1, int(limit_n * 0.1))  # autosave every 10% (sequential)
+            interval = max(1, int(limit_n * 0.1))  # autosave every 10%
 
-            def build_norm_path(rel_path_str: str) -> str:
-                n = rel_path_str.replace("\\", "/")
-                found = False
-                for marker in ["train/", "valid/", "test/"]:
-                    pos = n.find(marker)
-                    if pos != -1:
-                        n = n[pos:]
-                        found = True
-                        break
-                if not found:
-                    if split == "fit":
-                        n = "train/" + n
-                    elif split == "validate":
-                        n = "valid/" + n
-                    else:
-                        n = "test/" + n
-                return n
-
-            def process_one(index: int, use_thread_predictor: bool) -> None:
+            for idx in tqdm(range(limit_n), desc=f"SAM masks {split} ({limit_n}/{total})"):
                 try:
-                    rel = dataset.rel_paths[index]
-                    abs_p = dataset._resolve_path(rel)
-                    norm_p = build_norm_path(rel)
+                    # Access path resolution as in dataset
+                    rel_path = dataset.rel_paths[idx]
+                    abs_path = dataset._resolve_path(rel_path)
+                    # save as pt mirroring split/relative path
+                    norm = rel_path.replace("\\", "/")
+                    # Keep only the part starting from the split folder (train/|valid/|test/)
+                    found_marker = False
+                    for marker in ["train/", "valid/", "test/"]:
+                        pos = norm.find(marker)
+                        if pos != -1:
+                            norm = norm[pos:]
+                            found_marker = True
+                            break
+                    if not found_marker:
+                        # fallback: prefix based on current split
+                        if split == "fit":
+                            norm = "train/" + norm
+                        elif split == "validate":
+                            norm = "valid/" + norm
+                        else:
+                            norm = "test/" + norm
 
                     # Resume skipping logic
                     if args.single_file:
-                        # quick check without lock
-                        if norm_p in existing_paths:
-                            return
+                        if norm in existing_paths:
+                            continue
                     else:
                         if args.jsonl:
-                            op = os.path.join(args.output_dir, os.path.splitext(norm_p)[0] + ".jsonl")
-                            if os.path.exists(op):
-                                return
+                            out_path = os.path.join(args.output_dir, os.path.splitext(norm)[0] + ".jsonl")
+                            if os.path.exists(out_path):
+                                continue
                         else:
-                            op = os.path.join(args.output_dir, os.path.splitext(norm_p)[0] + ".pt")
-                            if os.path.exists(op):
-                                return
+                            out_path = os.path.join(args.output_dir, os.path.splitext(norm)[0] + ".pt")
+                            if os.path.exists(out_path):
+                                continue
 
-                    # get predictor
-                    pred_inst = get_thread_predictor() if use_thread_predictor else predictor
-                    m = predict_mask_for_image(pred_inst, abs_p, target_size=args.target_size)
+                    mask = predict_mask_for_image(predictor, abs_path, target_size=args.target_size)
 
                     if args.single_file:
-                        m_np = m.cpu().numpy().astype("uint16")
-                        rec = {"path": norm_p, "mask": m_np.tolist()}
-                        if use_threads:
-                            with writer_lock:
-                                os.makedirs(args.output_dir, exist_ok=True)
-                                with open(single_file_path, "a", encoding="utf-8") as f:
-                                    f.write(json.dumps(rec) + "\n")
-                                existing_paths.add(norm_p)
-                        else:
-                            pending_records.append(rec)
-                            existing_paths.add(norm_p)
+                        # Save multi-class mask directly (not binary) into pending buffer
+                        mask_np = mask.cpu().numpy().astype("uint16")
+                        rec = {"path": norm, "mask": mask_np.tolist()}
+                        pending_records.append(rec)
+                        existing_paths.add(norm)
+                        # autosave by 10%
+                        if ((idx + 1) % interval) == 0:
+                            flush_pending()
                     else:
                         if args.jsonl:
-                            m_bin = (m > 0).to(torch.uint8).cpu().numpy()
-                            rec = {"path": norm_p, "rle": rle_encode_binary(m_bin)}
-                            op = os.path.join(args.output_dir, os.path.splitext(norm_p)[0] + ".jsonl")
-                            os.makedirs(os.path.dirname(op), exist_ok=True)
-                            with open(op, "a", encoding="utf-8") as f:
+                            mask_bin = (mask > 0).to(torch.uint8).cpu().numpy()
+                            rec = {"path": norm, "rle": rle_encode_binary(mask_bin)}
+                            out_path = os.path.join(args.output_dir, os.path.splitext(norm)[0] + ".jsonl")
+                            os.makedirs(os.path.dirname(out_path), exist_ok=True)
+                            with open(out_path, "a", encoding="utf-8") as f:
                                 f.write(json.dumps(rec) + "\n")
                         else:
-                            op = os.path.join(args.output_dir, os.path.splitext(norm_p)[0] + ".pt")
-                            save_mask_tensor(m, op)
+                            out_path = os.path.join(args.output_dir, os.path.splitext(norm)[0] + ".pt")
+                            save_mask_tensor(mask, out_path)
 
-                    # collect viz candidates
-                    if args.viz:
-                        with viz_lock:
-                            if len(viz_candidates) < max(1, int(args.viz_num_samples)):
-                                viz_candidates.append((norm_p, split, abs_p))
+                    # collect candidates for later visualization
+                    if args.viz and len(viz_candidates) < max(1, int(args.viz_num_samples)):
+                        viz_candidates.append((norm, split, abs_path))
                 except Exception:
-                    return
+                    continue
 
-            if use_threads:
-                with ThreadPoolExecutor(max_workers=max(1, int(args.concurrency))) as executor:
-                    futures = [executor.submit(process_one, idx, True) for idx in range(limit_n)]
-                    for _ in tqdm(as_completed(futures), total=limit_n, desc=f"SAM masks {split} ({limit_n}/{total})"):
-                        pass
-            else:
-                for idx in tqdm(range(limit_n), desc=f"SAM masks {split} ({limit_n}/{total})"):
-                    process_one(idx, False)
-                    # autosave by 10%
-                    if args.single_file and ((idx + 1) % interval) == 0:
-                        flush_pending()
-
-            # flush end of split (sequential path)
-            if not use_threads:
-                flush_pending()
+            # flush end of split
+            flush_pending()
     except KeyboardInterrupt:
         # ensure pending data are saved
         flush_pending()
