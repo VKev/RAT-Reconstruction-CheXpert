@@ -98,6 +98,8 @@ def main():
     parser.add_argument("--sam-model-type", type=str, default="vit_b", choices=["vit_b","vit_l","vit_h"], help="SAM model type")
     parser.add_argument("--device", type=str, default="cuda", choices=["cuda","cpu"], help="Device for SAM inference")
     parser.add_argument("--target-size", type=int, default=224, help="Resize input image to this square size before SAM (e.g., 224)")
+    parser.add_argument("--batch-size", type=int, default=1, help="Batch size for datamodule/dataloader (SAM inference remains per-image)")
+    parser.add_argument("--num-workers", type=int, default=0, help="Number of DataLoader workers for datamodule")
     # CheXpert paths
     parser.add_argument("--chexpert-train-csv", type=str, default=r"C:\Vkev\Repos\Region-Attention-Transformer-for-Medical-Image-Restoration\data\archive\train.csv",
                         help="Path to CheXpert training CSV (with 'Path' column)")
@@ -170,8 +172,8 @@ def main():
 
     dm = ImageDataModule(
         dataset=args.dataset,
-        batch_size=1,
-        num_workers=0,
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
         chexpert_train_csv=args.chexpert_train_csv,
         chexpert_val_csv=args.chexpert_val_csv,
         chexpert_test_csv=args.chexpert_test_csv,
