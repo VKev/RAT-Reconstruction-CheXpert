@@ -30,6 +30,10 @@ class ImageDataModule(L.LightningDataModule):
                  chexpert_valid_root: Optional[str] = None,
                  chexpert_test_root: Optional[str] = None,
                  chexpert_policy: str = "ones",
+                 chexpert_exclude_support_devices: bool = False,
+                 chexpert_only_support_devices: bool = False,
+                 chexpert_mask_dir: Optional[str] = None,
+                 chexpert_mask_file: Optional[str] = None,
                  ):
         super().__init__()
         self.data_dir = data_dir
@@ -45,6 +49,10 @@ class ImageDataModule(L.LightningDataModule):
         self.chexpert_valid_root = chexpert_valid_root
         self.chexpert_test_root = chexpert_test_root
         self.chexpert_policy = chexpert_policy
+        self.chexpert_exclude_support_devices = chexpert_exclude_support_devices
+        self.chexpert_only_support_devices = chexpert_only_support_devices
+        self.chexpert_mask_dir = chexpert_mask_dir
+        self.chexpert_mask_file = chexpert_mask_file
 
         # Keep pixels in [0,1]; models should output [0,1] (we use Sigmoid in the default VAE).
         if self.dataset == "cifar10":
@@ -112,6 +120,10 @@ class ImageDataModule(L.LightningDataModule):
                     split="train",
                     transform=self.transform,
                     policy=self.chexpert_policy,
+                    exclude_support_devices=self.chexpert_exclude_support_devices,
+                    include_only_support_devices=self.chexpert_only_support_devices,
+                    mask_dir=self.chexpert_mask_dir,
+                    mask_file=self.chexpert_mask_file,
                 )
                 self.val_set = CheXpertDataset(
                     csv_path=self.chexpert_val_csv,
@@ -122,6 +134,10 @@ class ImageDataModule(L.LightningDataModule):
                     split="valid",
                     transform=self.transform,
                     policy=self.chexpert_policy,
+                    exclude_support_devices=self.chexpert_exclude_support_devices,
+                    include_only_support_devices=self.chexpert_only_support_devices,
+                    mask_dir=self.chexpert_mask_dir,
+                    mask_file=self.chexpert_mask_file,
                 )
 
         if stage in (None, "test", "validate"):
@@ -139,6 +155,10 @@ class ImageDataModule(L.LightningDataModule):
                     split="test",
                     transform=self.transform,
                     policy=self.chexpert_policy,
+                    exclude_support_devices=self.chexpert_exclude_support_devices,
+                    include_only_support_devices=self.chexpert_only_support_devices,
+                    mask_dir=self.chexpert_mask_dir,
+                    mask_file=self.chexpert_mask_file,
                 )
 
     def train_dataloader(self) -> DataLoader:
@@ -169,7 +189,9 @@ class CheXpertDataset(torch.utils.data.Dataset):
 
     def __init__(self, csv_path: str, root_dir: Optional[str] = None, transform: Optional[T.Compose] = None,
                  policy: str = "ones", split: Optional[str] = None,
-                 train_root: Optional[str] = None, valid_root: Optional[str] = None, test_root: Optional[str] = None):
+                 train_root: Optional[str] = None, valid_root: Optional[str] = None, test_root: Optional[str] = None,
+                 exclude_support_devices: bool = False, include_only_support_devices: bool = False,
+                 mask_dir: Optional[str] = None, mask_file: Optional[str] = None):
         super().__init__()
         self.csv_path = csv_path
         self.root_dir = root_dir
@@ -179,8 +201,17 @@ class CheXpertDataset(torch.utils.data.Dataset):
         self.train_root = train_root
         self.valid_root = valid_root
         self.test_root = test_root
+        self.exclude_support_devices = exclude_support_devices
+        self.include_only_support_devices = include_only_support_devices
+        self.num_rows_before_filter: int = 0
+        self.num_rows_after_filter: int = 0
+        self.num_filtered_out: int = 0
+        self.mask_dir = mask_dir
+        self.mask_file = mask_file
+        self.mask_mapping = None
 
         df = pd.read_csv(csv_path)
+        self.num_rows_before_filter = len(df)
 
         # Normalize uncertain and missing labels, though labels are not used downstream
         cols_present = [c for c in self.LABEL_COLUMNS if c in df.columns]
@@ -191,7 +222,57 @@ class CheXpertDataset(torch.utils.data.Dataset):
                 df[cols_present] = df[cols_present].replace(-1, 0)
             df[cols_present] = df[cols_present].fillna(0)
 
-        self.paths: List[str] = df["Path"].astype(str).tolist()
+        # Optionally filter by Support Devices (after applying uncertainty policy)
+        # Precedence: include_only_support_devices > exclude_support_devices
+        if self.include_only_support_devices and ("Support Devices" in df.columns):
+            try:
+                before = len(df)
+                df = df[df["Support Devices"].fillna(0) == 1]
+                after = len(df)
+                self.num_rows_after_filter = after
+                self.num_filtered_out = max(0, before - after)
+            except Exception:
+                self.num_rows_after_filter = len(df)
+                self.num_filtered_out = 0
+        elif self.exclude_support_devices and ("Support Devices" in df.columns):
+            try:
+                before = len(df)
+                df = df[df["Support Devices"].fillna(0) == 0]
+                after = len(df)
+                self.num_rows_after_filter = after
+                self.num_filtered_out = max(0, before - after)
+            except Exception:
+                # If filter fails for any reason, fall back to unfiltered
+                self.num_rows_after_filter = len(df)
+                self.num_filtered_out = 0
+        else:
+            self.num_rows_after_filter = len(df)
+            self.num_filtered_out = 0
+
+        # Keep relative paths for mask lookup
+        self.rel_paths: List[str] = df["Path"].astype(str).tolist()
+        self.paths: List[str] = self.rel_paths
+        # If a single mask file is provided, load once
+        if self.mask_file is not None and os.path.exists(self.mask_file):
+            try:
+                # If JSONL (RLE), parse as lightweight single-file
+                if self.mask_file.lower().endswith('.jsonl'):
+                    import json
+                    self.mask_mapping = {}
+                    with open(self.mask_file, 'r', encoding='utf-8') as f:
+                        for line in f:
+                            line = line.strip()
+                            if not line:
+                                continue
+                            rec = json.loads(line)
+                            key = str(rec.get('path', '')).replace('\\', '/')
+                            self.mask_mapping[key] = rec.get('rle')
+                else:
+                    obj = torch.load(self.mask_file, map_location="cpu")
+                    mapping = obj.get("masks", obj)
+                    self.mask_mapping = {str(k).replace("\\", "/"): torch.as_tensor(v) for k, v in mapping.items()}
+            except Exception:
+                self.mask_mapping = None
 
     def _resolve_path(self, rel_or_abs: str) -> str:
         # If absolute (Windows or POSIX) and exists, return
@@ -245,11 +326,89 @@ class CheXpertDataset(torch.utils.data.Dataset):
         return len(self.paths)
 
     def __getitem__(self, idx: int):
-        path = self._resolve_path(self.paths[idx])
+        rel_path = self.rel_paths[idx]
+        path = self._resolve_path(rel_path)
         if not os.path.exists(path):
             raise FileNotFoundError(f"CheXpert image not found: {path}")
         img = Image.open(path).convert("RGB")
         if self.transform is not None:
             img = self.transform(img)
-        # Return dummy label to satisfy (x, _) protocol used by the training loop
-        return img, torch.tensor(0, dtype=torch.long)
+        # Try load offline mask if provided
+        mask_tensor = None
+        # Try global mask mapping first
+        if self.mask_mapping is not None and self.split in ("train", "valid", "test"):
+            try:
+                norm_key = rel_path.replace("\\", "/")
+                if not (norm_key.startswith("train/") or norm_key.startswith("valid/") or norm_key.startswith("test/")):
+                    norm_key = f"{self.split}/{norm_key}"
+                m = self.mask_mapping.get(norm_key, None)
+                if m is None:
+                    m = self.mask_mapping.get(norm_key.split("/", 1)[-1], None)
+                if m is not None:
+                    # If value is RLE dict, decode
+                    if isinstance(m, dict) and 'rle' in m and 'shape' in m:
+                        from utils import rle_decode_binary
+                        import torch as _torch
+                        mask_np = rle_decode_binary(m)
+                        mask_tensor = _torch.from_numpy(mask_np.astype('int64'))
+                    elif isinstance(m, list):
+                        # Multi-class mask stored as nested list
+                        import numpy as np
+                        mask_np = np.array(m, dtype='int64')
+                        mask_tensor = torch.from_numpy(mask_np)
+                    else:
+                        mask_tensor = torch.as_tensor(m)
+            except Exception:
+                mask_tensor = None
+        if mask_tensor is None and self.mask_dir is not None:
+            try:
+                norm = rel_path.replace("\\", "/")
+                # ensure split prefix present
+                if not (norm.startswith("train/") or norm.startswith("valid/") or norm.startswith("test/")):
+                    # best effort: try to detect any split keyword and reconstruct
+                    if "train/" in norm:
+                        norm = norm.split("train/", 1)[-1]
+                        norm = "train/" + norm
+                    elif "valid/" in norm:
+                        norm = norm.split("valid/", 1)[-1]
+                        norm = "valid/" + norm
+                    elif "test/" in norm:
+                        norm = norm.split("test/", 1)[-1]
+                        norm = "test/" + norm
+                mask_path = os.path.join(self.mask_dir, norm)
+                base, _ = os.path.splitext(mask_path)
+                mask_path = base + ".pt"
+                if os.path.exists(mask_path):
+                    mask_tensor = torch.load(mask_path)
+                    if isinstance(mask_tensor, dict) and "mask" in mask_tensor:
+                        mask_tensor = mask_tensor["mask"]
+                    if not torch.is_tensor(mask_tensor):
+                        mask_tensor = torch.as_tensor(mask_tensor)
+                    if mask_tensor.dim() == 3 and mask_tensor.size(0) == 1:
+                        mask_tensor = mask_tensor.squeeze(0)
+                    if mask_tensor.dtype != torch.long:
+                        mask_tensor = mask_tensor.long()
+                    # Resize to match image if needed
+                    h_img, w_img = img.shape[-2:]
+                    if mask_tensor.shape[-2:] != (h_img, w_img):
+                        mask_tensor = torch.nn.functional.interpolate(mask_tensor.unsqueeze(0).unsqueeze(0).float(),
+                                                                       size=(h_img, w_img), mode="nearest").squeeze(0).squeeze(0).long()
+            except Exception:
+                mask_tensor = None
+        # Final normalization for either source (mapping or dir): ensure type/shape
+        if mask_tensor is not None:
+            if not torch.is_tensor(mask_tensor):
+                mask_tensor = torch.as_tensor(mask_tensor)
+            if mask_tensor.dim() == 3 and mask_tensor.size(0) == 1:
+                mask_tensor = mask_tensor.squeeze(0)
+            if mask_tensor.dtype != torch.long:
+                mask_tensor = mask_tensor.long()
+            h_img, w_img = img.shape[-2:]
+            if mask_tensor.shape[-2:] != (h_img, w_img):
+                mask_tensor = torch.nn.functional.interpolate(mask_tensor.unsqueeze(0).unsqueeze(0).float(),
+                                                               size=(h_img, w_img), mode="nearest").squeeze(0).squeeze(0).long()
+        if mask_tensor is None:
+            # Fallback: dummy label
+            return img, torch.tensor(0, dtype=torch.long)
+        else:
+            return img, mask_tensor

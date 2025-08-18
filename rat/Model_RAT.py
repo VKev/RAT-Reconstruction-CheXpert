@@ -328,11 +328,13 @@ class RAT(nn.Module):
                  middle_blk_num=12, 
                  enc_blk_nums=[2, 2], 
                  dec_blk_nums=[2, 2], 
-                 loss_fun = None):
+                 loss_fun = None,
+                 skip_connection_strength: float = 1.0):
         
         super().__init__() 
         self.img_scale = scale
         self.mask_scale = 2**len(enc_blk_nums) 
+        self.skip_connection_strength = float(skip_connection_strength)
         
         
 
@@ -484,7 +486,8 @@ class RAT(nn.Module):
 
         for decoder, up, enc_skip in zip(self.decoders, self.ups, encs[::-1]):
             x = up(x)
-            x = x + enc_skip
+            if self.skip_connection_strength != 0.0:
+                x = x + self.skip_connection_strength * enc_skip
             x = decoder(x)
 
         x = self.ending(x)

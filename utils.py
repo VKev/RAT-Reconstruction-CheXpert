@@ -81,6 +81,55 @@ def generate_region_mask(batch_size, height, width, grid_h=14, grid_w=14, device
     mask = mask[:height, :width].unsqueeze(0).repeat(batch_size, 1, 1).float()
     return mask 
 
+
+def save_mask_tensor(mask: torch.Tensor, out_path: str):
+    """Save a mask tensor to .pt, creating parent dirs."""
+    import os
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    torch.save({"mask": mask.cpu()}, out_path)
+
+
+def load_mask_tensor(path: str) -> torch.Tensor:
+    """Load mask tensor from .pt saved by save_mask_tensor."""
+    obj = torch.load(path, map_location="cpu")
+    if isinstance(obj, dict) and "mask" in obj:
+        return obj["mask"]
+    return torch.as_tensor(obj)
+
+
+# -----------------
+# RLE helpers (binary masks)
+# -----------------
+def rle_encode_binary(mask_np) -> dict:
+    """Run-length encode a 2D binary numpy array. Returns dict with shape and rle list.
+    RLE format: list of pairs [start, length, ...] where start is 0-based index in flattened array.
+    """
+    import numpy as np
+    mask = mask_np.astype(np.uint8).ravel(order="C")
+    n = mask.size
+    # Find run starts
+    diffs = np.diff(np.concatenate(([0], mask, [0])).astype(np.int8))
+    run_starts = np.where(diffs == 1)[0]
+    run_ends = np.where(diffs == -1)[0]
+    run_lengths = run_ends - run_starts
+    rle = []
+    for s, l in zip(run_starts, run_lengths):
+        rle.extend([int(s), int(l)])
+    return {"shape": [int(mask_np.shape[0]), int(mask_np.shape[1])], "rle": rle}
+
+
+def rle_decode_binary(rle_obj) -> "np.ndarray":
+    """Decode RLE to 2D binary numpy array using the same format as rle_encode_binary."""
+    import numpy as np
+    h, w = rle_obj["shape"]
+    rle = rle_obj["rle"]
+    arr = np.zeros(h * w, dtype=np.uint8)
+    for i in range(0, len(rle), 2):
+        start = rle[i]
+        length = rle[i + 1]
+        arr[start:start + length] = 1
+    return arr.reshape((h, w), order="C")
+
 def calculate_psnr(img1, img2, crop_border, input_order='HWC', test_y_channel=True):
     """Calculate PSNR (Peak Signal-to-Noise Ratio).
 
