@@ -33,6 +33,8 @@ class SegmentedBestCheckpointCallback(L.Callback):
         self._segment_idx = 0
         self._segment_best_value = float("inf")
         self._segment_best_state = None
+        self._restored_from_ckpt = False
+        self._temp_best_relpath = None  # relative file name under dirpath
 
     def _resolve_dirpath(self, trainer: L.Trainer):
         # Prefer the directory used by an existing ModelCheckpoint callback
@@ -71,17 +73,22 @@ class SegmentedBestCheckpointCallback(L.Callback):
                 num_batches = 0
 
         num_batches = max(1, num_batches)
-        # Compute 1-indexed boundary batch indices for segments
-        boundaries = []
-        for i in range(1, self.segments + 1):
-            boundary = math.ceil(num_batches * (i / self.segments))
-            boundary = max(1, min(boundary, num_batches))
-            if not boundaries or boundary > boundaries[-1]:
-                boundaries.append(boundary)
-        self._boundaries = boundaries
-        self._segment_idx = 0
-        self._segment_best_value = float("inf")
-        self._segment_best_state = None
+        # If we are not restoring from ckpt with existing boundaries, compute them now
+        if not self._boundaries:
+            boundaries = []
+            for i in range(1, self.segments + 1):
+                boundary = math.ceil(num_batches * (i / self.segments))
+                boundary = max(1, min(boundary, num_batches))
+                if not boundaries or boundary > boundaries[-1]:
+                    boundaries.append(boundary)
+            self._boundaries = boundaries
+        # If not restored, this is a fresh epoch; reset tracking
+        if not self._restored_from_ckpt:
+            self._segment_idx = 0
+            self._segment_best_value = float("inf")
+            self._segment_best_state = None
+        # Clear the flag so following epochs behave normally
+        self._restored_from_ckpt = False
 
     def on_train_batch_end(self, trainer: L.Trainer, pl_module: L.LightningModule, outputs, batch, batch_idx: int) -> None:
         # Extract scalar training loss from outputs where possible
@@ -100,6 +107,22 @@ class SegmentedBestCheckpointCallback(L.Callback):
             try:
                 # Store a CPU copy of the best state_dict for this segment
                 self._segment_best_state = {k: v.detach().clone().cpu() for k, v in pl_module.state_dict().items()}
+                # Persist to a small temp file so we can resume mid-segment
+                try:
+                    epoch = int(trainer.current_epoch)
+                    seg_num = int(self._segment_idx + 1)
+                    tmp_name = f".tmp_epoch{epoch:02d}_seg{seg_num:02d}_best_state.pt"
+                    tmp_path = os.path.join(self._dirpath, tmp_name)
+                    if trainer.is_global_zero:
+                        torch.save(self._segment_best_state, tmp_path)
+                    try:
+                        trainer.strategy.barrier()
+                    except Exception:
+                        pass
+                    self._temp_best_relpath = tmp_name
+                except Exception:
+                    # If temp persist fails, keep in memory only
+                    pass
             except Exception:
                 self._segment_best_state = None
 
@@ -149,6 +172,60 @@ class SegmentedBestCheckpointCallback(L.Callback):
             # Restore original state on all ranks
             with torch.no_grad():
                 pl_module.load_state_dict(current_state, strict=True)
+        # Clean up temp file after successful save
+        try:
+            if self._temp_best_relpath:
+                tmp_path = os.path.join(self._dirpath, self._temp_best_relpath)
+                if trainer.is_global_zero and os.path.isfile(tmp_path):
+                    os.remove(tmp_path)
+                self._temp_best_relpath = None
+            try:
+                trainer.strategy.barrier()
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    # -------------
+    # Checkpoint I/O
+    # -------------
+    def on_save_checkpoint(self, trainer: L.Trainer, pl_module: L.LightningModule) -> dict:
+        # Do NOT store _segment_best_state to avoid duplicating full model weights
+        return {
+            "segments": int(self.segments),
+            "boundaries": list(self._boundaries or []),
+            "segment_idx": int(self._segment_idx),
+            "segment_best_value": float(self._segment_best_value),
+            "temp_best_relpath": self._temp_best_relpath,
+        }
+
+    def on_load_checkpoint(self, trainer: L.Trainer, pl_module: L.LightningModule, callback_state: dict) -> None:
+        try:
+            self.segments = int(callback_state.get("segments", self.segments))
+            b = callback_state.get("boundaries", None)
+            self._boundaries = list(b) if isinstance(b, (list, tuple)) else None
+            self._segment_idx = int(callback_state.get("segment_idx", 0))
+            self._segment_best_value = float(callback_state.get("segment_best_value", float("inf")))
+            # Try to restore temp best state if available
+            self._segment_best_state = None
+            self._temp_best_relpath = callback_state.get("temp_best_relpath", None)
+            if self._temp_best_relpath and self._dirpath:
+                tmp_path = os.path.join(self._dirpath, self._temp_best_relpath)
+                if os.path.isfile(tmp_path):
+                    try:
+                        obj = torch.load(tmp_path, map_location="cpu")
+                        if isinstance(obj, dict):
+                            self._segment_best_state = obj
+                    except Exception:
+                        self._segment_best_state = None
+            self._restored_from_ckpt = True
+        except Exception:
+            # Fall back to fresh state if anything goes wrong
+            self._boundaries = None
+            self._segment_idx = 0
+            self._segment_best_value = float("inf")
+            self._segment_best_state = None
+            self._restored_from_ckpt = False
 
 
 
