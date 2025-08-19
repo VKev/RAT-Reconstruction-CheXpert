@@ -13,7 +13,7 @@ from datamodule import ImageDataModule
 from model import SmallVAE
 from rat.Model_RAT import RAT
 from loss import make_criterion, kl_divergence, FocalRegionLoss
-from save import SavePredictionsCallback
+from save import SavePredictionsCallback, SegmentedBestCheckpointCallback
 from utils import get_recon, generate_region_mask
 
 
@@ -326,6 +326,7 @@ def main():
     # Callbacks
     callbacks = [
         ModelCheckpoint(monitor="loss/val", mode="min", save_top_k=1, filename="best-{epoch:02d}"),
+        SegmentedBestCheckpointCallback(segments=10),
         LearningRateMonitor(logging_interval="step"),
         TQDMProgressBar(),
     ]
