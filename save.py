@@ -50,7 +50,6 @@ class SegmentedBestCheckpointCallback(L.Callback):
 
         if not dirpath:
             # Fallback to default_root_dir/checkpoints
-            import os
             dirpath = os.path.join(trainer.default_root_dir or "outputs", "checkpoints")
         os.makedirs(dirpath, exist_ok=True)
         self._dirpath = dirpath
