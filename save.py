@@ -86,6 +86,16 @@ class SegmentedBestCheckpointCallback(L.Callback):
             self._segment_idx = 0
             self._segment_best_value = float("inf")
             self._segment_best_state = None
+        # If we were restored, try to reload temp best state from disk now that dirpath is known
+        if self._restored_from_ckpt and self._temp_best_relpath and self._dirpath:
+            try:
+                tmp_path = os.path.join(self._dirpath, self._temp_best_relpath)
+                if os.path.isfile(tmp_path):
+                    obj = torch.load(tmp_path, map_location="cpu")
+                    if isinstance(obj, dict):
+                        self._segment_best_state = obj
+            except Exception:
+                self._segment_best_state = None
         # Clear the flag so following epochs behave normally
         self._restored_from_ckpt = False
 
@@ -188,7 +198,12 @@ class SegmentedBestCheckpointCallback(L.Callback):
     # -------------
     # Checkpoint I/O
     # -------------
-    def on_save_checkpoint(self, trainer: L.Trainer, pl_module: L.LightningModule) -> dict:
+    def on_save_checkpoint(self, trainer: L.Trainer, pl_module: L.LightningModule, checkpoint: dict) -> None:
+        # Lightning v2 passes `checkpoint` to mutate in-place. We keep state in state_dict instead.
+        # Intentionally no-op to avoid duplicating weights/state here.
+        return None
+
+    def state_dict(self) -> dict:
         # Do NOT store _segment_best_state to avoid duplicating full model weights
         return {
             "segments": int(self.segments),
@@ -198,25 +213,16 @@ class SegmentedBestCheckpointCallback(L.Callback):
             "temp_best_relpath": self._temp_best_relpath,
         }
 
-    def on_load_checkpoint(self, trainer: L.Trainer, pl_module: L.LightningModule, callback_state: dict) -> None:
+    def load_state_dict(self, state_dict: dict) -> None:
         try:
-            self.segments = int(callback_state.get("segments", self.segments))
-            b = callback_state.get("boundaries", None)
+            self.segments = int(state_dict.get("segments", self.segments))
+            b = state_dict.get("boundaries", None)
             self._boundaries = list(b) if isinstance(b, (list, tuple)) else None
-            self._segment_idx = int(callback_state.get("segment_idx", 0))
-            self._segment_best_value = float(callback_state.get("segment_best_value", float("inf")))
-            # Try to restore temp best state if available
+            self._segment_idx = int(state_dict.get("segment_idx", 0))
+            self._segment_best_value = float(state_dict.get("segment_best_value", float("inf")))
+            # Defer loading of temp best state until dirpath is resolved
             self._segment_best_state = None
-            self._temp_best_relpath = callback_state.get("temp_best_relpath", None)
-            if self._temp_best_relpath and self._dirpath:
-                tmp_path = os.path.join(self._dirpath, self._temp_best_relpath)
-                if os.path.isfile(tmp_path):
-                    try:
-                        obj = torch.load(tmp_path, map_location="cpu")
-                        if isinstance(obj, dict):
-                            self._segment_best_state = obj
-                    except Exception:
-                        self._segment_best_state = None
+            self._temp_best_relpath = state_dict.get("temp_best_relpath", None)
             self._restored_from_ckpt = True
         except Exception:
             # Fall back to fresh state if anything goes wrong
