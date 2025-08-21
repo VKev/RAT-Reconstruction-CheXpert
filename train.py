@@ -187,7 +187,9 @@ class LitAutoModule(L.LightningModule):
             y_support = torch.zeros(x.size(0), device=x.device)
         # Compute L = [(1-y)*recon_loss + 1] / [y*recon_loss*ssim_att + 1]
         L_term = ((1.0 - y_support) * loss_recon + 1.0) / (y_support * loss_recon * ssim_att + 1.0)
-        total = L_term
+        L_term_mean = L_term.mean()
+        self.log("loss/L_term", L_term_mean, prog_bar=False, on_step=True, on_epoch=True)
+        total = L_term_mean
 
         if self.phase == 2:
             # Middle features for classification
@@ -266,7 +268,9 @@ class LitAutoModule(L.LightningModule):
         if y_support is None:
             y_support = torch.zeros(x.size(0), device=x.device)
         L_term = ((1.0 - y_support) * loss_recon + 1.0) / (y_support * loss_recon * ssim_att + 1.0)
-        total = L_term
+        L_term_mean = L_term.mean()
+        self.log("loss/L_term_val", L_term_mean, prog_bar=False, on_step=False, on_epoch=True)
+        total = L_term_mean
 
         if self.phase == 2:
             # Classification validation loss
