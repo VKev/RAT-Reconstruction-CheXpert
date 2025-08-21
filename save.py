@@ -371,13 +371,15 @@ class ClassificationAccEvalCallback(L.Callback):
                 preds = (torch.sigmoid(logits) > 0.5).float()
 
                 if labels.dim() == 1:
-                    labels = labels.unsqueeze(0).expand_as(preds)
-                # Align batch if needed
-                if labels.shape != preds.shape:
-                    try:
+                    labels = labels.unsqueeze(0)
+                # Align shapes to [B, C]
+                if labels.shape[1] != preds.shape[1]:
+                    if labels.shape[1] > preds.shape[1]:
                         labels = labels[:, : preds.shape[1]]
-                    except Exception:
-                        continue
+                    else:
+                        pad = torch.zeros(labels.shape[0], preds.shape[1] - labels.shape[1], device=labels.device)
+                        labels = torch.cat([labels, pad], dim=1)
+                labels = labels.expand_as(preds)
                 correct = (preds == labels).float().sum().item()
                 count = float(preds.numel())
                 total_correct += correct

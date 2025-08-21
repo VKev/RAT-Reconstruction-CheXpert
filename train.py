@@ -210,8 +210,19 @@ class LitAutoModule(L.LightningModule):
                 # Try zeros if labels unavailable
                 labels = torch.zeros(x.size(0), self.num_classes, device=logits.device)
             labels = labels.to(logits.device).float()
+            # Ensure multi-label shape [B, C]
             if labels.dim() == 1:
-                labels = labels.unsqueeze(0).expand(logits.size(0), -1)
+                labels = labels.unsqueeze(0)
+            # If flatten size matches logits, reshape
+            if labels.numel() == logits.numel() and labels.shape != logits.shape:
+                labels = labels.view_as(logits)
+            # Align class dimension
+            if labels.shape[1] != logits.shape[1]:
+                if labels.shape[1] > logits.shape[1]:
+                    labels = labels[:, : logits.shape[1]]
+                else:
+                    pad = torch.zeros(labels.shape[0], logits.shape[1] - labels.shape[1], device=labels.device)
+                    labels = torch.cat([labels, pad], dim=1)
             loss_cls = self.bce_logits(logits, labels)
             self.log("loss/cls", loss_cls, prog_bar=True, on_step=True, on_epoch=True)
             total = total + self.cls_weight * loss_cls
@@ -284,7 +295,15 @@ class LitAutoModule(L.LightningModule):
                     labels = torch.zeros(x.size(0), self.num_classes, device=logits.device)
                 labels = labels.to(logits.device).float()
                 if labels.dim() == 1:
-                    labels = labels.unsqueeze(0).expand(logits.size(0), -1)
+                    labels = labels.unsqueeze(0)
+                if labels.numel() == logits.numel() and labels.shape != logits.shape:
+                    labels = labels.view_as(logits)
+                if labels.shape[1] != logits.shape[1]:
+                    if labels.shape[1] > logits.shape[1]:
+                        labels = labels[:, : logits.shape[1]]
+                    else:
+                        pad = torch.zeros(labels.shape[0], logits.shape[1] - labels.shape[1], device=labels.device)
+                        labels = torch.cat([labels, pad], dim=1)
                 loss_cls = self.bce_logits(logits, labels)
                 self.log("loss/cls_val", loss_cls, prog_bar=True, on_step=False, on_epoch=True)
                 total = total + self.cls_weight * loss_cls
