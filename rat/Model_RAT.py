@@ -468,6 +468,11 @@ class RAT(nn.Module):
         mask = self.correlation_mask_oneBYone(mask, -1000) 
 
         
+        # channels_last forward for speed if possible
+        try:
+            inp = inp.contiguous(memory_format=torch.channels_last)
+        except Exception:
+            pass
         x = self.intro(inp)
 
         encs = []

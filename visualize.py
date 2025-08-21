@@ -207,6 +207,10 @@ def main():
         print("[visualize] --num-samples must be >= 1")
         sys.exit(1)
     x = x.to(device)
+    try:
+        x = x.contiguous(memory_format=torch.channels_last)
+    except Exception:
+        pass
 
     # Register a forward hook to capture latent feature maps
     captured = {"feat": None}

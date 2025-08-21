@@ -64,6 +64,22 @@ class LitAutoModule(L.LightningModule):
                 nn.Linear(self.mlp_hidden, self.num_classes),
             )
             self.bce_logits = nn.BCEWithLogitsLoss()
+        # Cache for default grid masks per (device,b,h,w,grid_h,grid_w)
+        self._mask_cache: dict[tuple, torch.Tensor] = {}
+
+    def _get_default_mask(self, batch_size: int, height: int, width: int, device: torch.device) -> torch.Tensor:
+        key = (device.type, int(getattr(device, 'index', -1) or -1), batch_size, height, width,
+               int(getattr(self.hparams, "grid_h", 14)), int(getattr(self.hparams, "grid_w", 14)))
+        m = self._mask_cache.get(key, None)
+        if m is None or m.device != device:
+            m = generate_region_mask(
+                batch_size, height, width,
+                grid_h=int(getattr(self.hparams, "grid_h", 14)),
+                grid_w=int(getattr(self.hparams, "grid_w", 14)),
+                device=device,
+            )
+            self._mask_cache[key] = m
+        return m
 
     def forward(self, x, mask: torch.Tensor | None = None):
         try:
@@ -115,6 +131,11 @@ class LitAutoModule(L.LightningModule):
         if noise_std > 0.0:
             noise = torch.randn_like(x) * noise_std
             x_in = (x + noise).clamp(0, 1)
+        # Prefer channels_last for faster CUDA convolutions
+        try:
+            x_in = x_in.contiguous(memory_format=torch.channels_last)
+        except Exception:
+            pass
         # Choose mask strategy
         mask = None
         labels = None
@@ -125,12 +146,7 @@ class LitAutoModule(L.LightningModule):
         if mask is None:
             if use_default:
                 b, _, hh, ww = x_in.shape
-                mask = generate_region_mask(
-                    b, hh, ww,
-                    grid_h=int(getattr(self.hparams, "grid_h", 14)),
-                    grid_w=int(getattr(self.hparams, "grid_w", 14)),
-                    device=x_in.device,
-                )
+                mask = self._get_default_mask(b, hh, ww, device=x_in.device)
             else:
                 try:
                     if torch.is_tensor(y) and y.dim() >= 2:
@@ -183,18 +199,18 @@ class LitAutoModule(L.LightningModule):
             if mask is None:
                 if use_default:
                     b, _, hh, ww = x.shape
-                    mask = generate_region_mask(
-                        b, hh, ww,
-                        grid_h=int(getattr(self.hparams, "grid_h", 14)),
-                        grid_w=int(getattr(self.hparams, "grid_w", 14)),
-                        device=x.device,
-                    )
+                    mask = self._get_default_mask(b, hh, ww, device=x.device)
                 else:
                     try:
                         if torch.is_tensor(y) and y.dim() >= 2:
                             mask = y
                     except Exception:
                         mask = None
+            # Prefer channels_last for faster CUDA convolutions
+            try:
+                x = x.contiguous(memory_format=torch.channels_last)
+            except Exception:
+                pass
             out = self(x, mask=mask)
         loss_recon = self._compute_loss(x, out, mask_for_loss=mask)
         total = loss_recon * self.recon_weight
