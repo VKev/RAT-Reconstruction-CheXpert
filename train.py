@@ -591,7 +591,13 @@ def main():
                 save_dir=args.output_dir,
                 log_model=False,
             )
-            print("[wandb] Logging enabled")
+            try:
+                run_url = getattr(wandb_logger.experiment, 'url', None)
+            except Exception:
+                run_url = None
+            print(f"[wandb] Logging enabled - project={wandb_logger.project_name}, entity={wandb_logger.experiment.entity if hasattr(wandb_logger, 'experiment') else args.wandb_entity}")
+            if run_url:
+                print(f"[wandb] run: {run_url}")
         except Exception as e:
             print(f"[wandb] Failed to initialize logging: {e}")
 
