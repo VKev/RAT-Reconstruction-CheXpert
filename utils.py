@@ -24,6 +24,44 @@ def get_recon(x):
                 return v
     raise ValueError("Could not parse reconstruction tensor from model output")
 
+
+def ssim_tensor(x: torch.Tensor, y: torch.Tensor, window_size: int = 11, channel: int | None = None, size_average: bool = True) -> torch.Tensor:
+    """Differentiable SSIM for PyTorch tensors in [0,1].
+
+    This is a lightweight implementation; for exactness, you can swap with a library version.
+    Returns SSIM in [-1, 1].
+    """
+    import torch as _torch
+    if channel is None:
+        channel = x.size(1)
+    # Gaussian window
+    def _gaussian(window_size, sigma):
+        gauss = _torch.tensor([_torch.exp(_torch.tensor(-(i - window_size // 2) ** 2) / (2 * sigma ** 2)) for i in range(window_size)], dtype=x.dtype, device=x.device)
+        return gauss / gauss.sum()
+    def _create_window(window_size, channel):
+        _1D_window = _gaussian(window_size, 1.5).unsqueeze(1)
+        _2D_window = _1D_window @ _1D_window.t()
+        window = _2D_window.expand(channel, 1, window_size, window_size).contiguous()
+        return window
+    window = _create_window(window_size, channel)
+    mu1 = _torch.nn.functional.conv2d(x, window, padding=window_size // 2, groups=channel)
+    mu2 = _torch.nn.functional.conv2d(y, window, padding=window_size // 2, groups=channel)
+    mu1_sq = mu1.pow(2)
+    mu2_sq = mu2.pow(2)
+    mu1_mu2 = mu1 * mu2
+
+    sigma1_sq = _torch.nn.functional.conv2d(x * x, window, padding=window_size // 2, groups=channel) - mu1_sq
+    sigma2_sq = _torch.nn.functional.conv2d(y * y, window, padding=window_size // 2, groups=channel) - mu2_sq
+    sigma12 = _torch.nn.functional.conv2d(x * y, window, padding=window_size // 2, groups=channel) - mu1_mu2
+
+    C1 = 0.01 ** 2
+    C2 = 0.03 ** 2
+    ssim_map = ((2 * mu1_mu2 + C1) * (2 * sigma12 + C2)) / ((mu1_sq + mu2_sq + C1) * (sigma1_sq + sigma2_sq + C2))
+    if size_average:
+        return ssim_map.mean()
+    else:
+        return ssim_map.mean(1).mean(1).mean(1)
+
 def load_img(filepath, grayscale=False):
     if not grayscale:
         img = cv2.cvtColor(cv2.imread(filepath), cv2.COLOR_BGR2RGB) 

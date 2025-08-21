@@ -14,7 +14,7 @@ from model import SmallVAE
 from rat.Model_RAT import RAT
 from loss import make_criterion, kl_divergence, FocalRegionLoss
 from save import SavePredictionsCallback, SegmentedBestCheckpointCallback, ClassificationAccEvalCallback
-from utils import get_recon, generate_region_mask
+from utils import get_recon, generate_region_mask, ssim_tensor
 
 
 # -------------------------------
@@ -155,8 +155,39 @@ class LitAutoModule(L.LightningModule):
                     mask = None
 
         out = self(x_in, mask=mask)
+        # Reconstruction loss as before (rec)
         loss_recon = self._compute_loss(x, out, mask_for_loss=mask)
-        total = loss_recon * self.recon_weight
+        # SSIM-based adaptive weighting term
+        with torch.no_grad():
+            recon = get_recon(out).clamp(0, 1)
+            ssim_val = ssim_tensor(recon, x)
+            ssim_att = (ssim_val + 1.0) / 2.0  # [-1,1] -> [0,1]
+        # y_support: 1 if Support Devices else 0 (phase 2 expects labels)
+        y_support = None
+        if isinstance(y, dict) and (labels is not None):
+            # Try to locate the Support Devices column: last index if name present
+            try:
+                # labels shape: [B, C]
+                # assume order from dataset; find index by name if provided via datamodule mapping
+                idx = None
+                try:
+                    dm = getattr(self.trainer, 'datamodule', None)
+                    if dm is not None and hasattr(dm, 'train_set') and hasattr(dm.train_set, 'labels_index_map'):
+                        idx = dm.train_set.labels_index_map.get('Support Devices', None)
+                except Exception:
+                    idx = None
+                if idx is None:
+                    # Fallback: try last column
+                    idx = labels.size(1) - 1
+                y_support = (labels[:, idx] > 0.5).float()
+            except Exception:
+                y_support = None
+        # If no labels or not in phase2, default y_support=0
+        if y_support is None:
+            y_support = torch.zeros(x.size(0), device=x.device)
+        # Compute L = [(1-y)*recon_loss + 1] / [y*recon_loss*ssim_att + 1]
+        L_term = ((1.0 - y_support) * loss_recon + 1.0) / (y_support * loss_recon * ssim_att + 1.0)
+        total = L_term
 
         if self.phase == 2:
             # Middle features for classification
@@ -213,7 +244,29 @@ class LitAutoModule(L.LightningModule):
                 pass
             out = self(x, mask=mask)
         loss_recon = self._compute_loss(x, out, mask_for_loss=mask)
-        total = loss_recon * self.recon_weight
+        with torch.no_grad():
+            recon = get_recon(out).clamp(0, 1)
+            ssim_val = ssim_tensor(recon, x)
+            ssim_att = (ssim_val + 1.0) / 2.0
+        y_support = None
+        if isinstance(y, dict) and (labels is not None):
+            try:
+                idx = None
+                try:
+                    dm = getattr(self.trainer, 'datamodule', None)
+                    if dm is not None and hasattr(dm, 'train_set') and hasattr(dm.train_set, 'labels_index_map'):
+                        idx = dm.train_set.labels_index_map.get('Support Devices', None)
+                except Exception:
+                    idx = None
+                if idx is None:
+                    idx = labels.size(1) - 1
+                y_support = (labels[:, idx] > 0.5).float()
+            except Exception:
+                y_support = None
+        if y_support is None:
+            y_support = torch.zeros(x.size(0), device=x.device)
+        L_term = ((1.0 - y_support) * loss_recon + 1.0) / (y_support * loss_recon * ssim_att + 1.0)
+        total = L_term
 
         if self.phase == 2:
             # Classification validation loss

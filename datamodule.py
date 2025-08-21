@@ -222,6 +222,9 @@ class CheXpertDataset(torch.utils.data.Dataset):
 
         # Normalize uncertain and missing labels, though labels are not used downstream
         cols_present = [c for c in self.LABEL_COLUMNS if c in df.columns]
+        # Expose mapping from label name to column index (for downstream usage)
+        self.label_cols_present = list(cols_present)
+        self.labels_index_map = {name: i for i, name in enumerate(self.label_cols_present)}
         if cols_present:
             if policy == "ones":
                 df[cols_present] = df[cols_present].replace(-1, 1)
