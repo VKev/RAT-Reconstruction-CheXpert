@@ -8,6 +8,7 @@ from torch.utils.data import DataLoader
 
 import lightning as L
 from lightning.pytorch.callbacks import ModelCheckpoint, LearningRateMonitor, TQDMProgressBar
+from lightning.pytorch.loggers import WandbLogger
 
 from datamodule import ImageDataModule
 from model import SmallVAE
@@ -415,6 +416,11 @@ def main():
     parser.add_argument("--ckpt-path", type=str, default=None, help="Resume from checkpoint path")
     parser.add_argument("--output-dir", type=str, default="outputs")
     parser.add_argument("--save-samples", action="store_true", help="Save sample reconstructions each val epoch")
+    # Weights & Biases logging
+    parser.add_argument("--wandb-api-key", type=str, default=None, help="W&B API key to enable online logging")
+    parser.add_argument("--wandb-project", type=str, default="RAT-Medical-Image-Restoration", help="W&B project name")
+    parser.add_argument("--wandb-entity", type=str, default=None, help="W&B entity (team/user)")
+    parser.add_argument("--wandb-run-name", type=str, default=None, help="W&B run name")
 
     args = parser.parse_args()
 
@@ -572,6 +578,23 @@ def main():
     if args.phase == 2:
         callbacks.append(ClassificationAccEvalCallback(segments=10, max_eval_batches=50))
 
+    # Optional W&B logger
+    wandb_logger = None
+    if args.wandb_api_key:
+        try:
+            import wandb
+            wandb.login(key=args.wandb_api_key)
+            wandb_logger = WandbLogger(
+                project=args.wandb_project,
+                entity=args.wandb_entity if args.wandb_entity else None,
+                name=args.wandb_run_name if args.wandb_run_name else None,
+                save_dir=args.output_dir,
+                log_model=False,
+            )
+            print("[wandb] Logging enabled")
+        except Exception as e:
+            print(f"[wandb] Failed to initialize logging: {e}")
+
     trainer = L.Trainer(
         accelerator="auto",
         devices=parse_devices(args.devices),
@@ -584,6 +607,7 @@ def main():
         limit_test_batches=args.limit_test_batches,
         default_root_dir=args.output_dir,
         callbacks=callbacks,
+        logger=wandb_logger if wandb_logger is not None else True,
     )
 
     trainer.fit(lit, datamodule=dm, ckpt_path=args.ckpt_path)
