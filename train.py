@@ -13,7 +13,7 @@ from datamodule import ImageDataModule
 from model import SmallVAE
 from rat.Model_RAT import RAT
 from loss import make_criterion, kl_divergence, FocalRegionLoss
-from save import SavePredictionsCallback, SegmentedBestCheckpointCallback
+from save import SavePredictionsCallback, SegmentedBestCheckpointCallback, ClassificationAccEvalCallback
 from utils import get_recon, generate_region_mask
 
 
@@ -37,7 +37,9 @@ class LitAutoModule(L.LightningModule):
     def __init__(self, model: nn.Module, lr: float = 1e-3, loss: str = "mse",
                  add_kld_if_available: bool = True, beta: float = 0.001,
                  input_noise_std: float = 0.0,
-                 use_default_grid_mask: bool = True, grid_h: int = 14, grid_w: int = 14):
+                 use_default_grid_mask: bool = True, grid_h: int = 14, grid_w: int = 14,
+                 phase: int = 1, num_classes: int = 14, cls_weight: float = 1.0, recon_weight: float = 1.0,
+                 mlp_hidden: int = 512):
         super().__init__()
         self.model = model
         self.save_hyperparameters(ignore=["model"])
@@ -46,6 +48,22 @@ class LitAutoModule(L.LightningModule):
         self.add_kld_if_available = add_kld_if_available
         self.beta = beta
         self.example_input_array = torch.randn(2, 3, 32, 32)
+        # Phase 2 components
+        self.phase = int(phase)
+        self.num_classes = int(num_classes)
+        self.cls_weight = float(cls_weight)
+        self.recon_weight = float(recon_weight)
+        self.mlp_hidden = int(mlp_hidden)
+        if self.phase == 2:
+            # Classification head: lazy inference of input dim
+            self.cls_head = nn.Sequential(
+                nn.AdaptiveAvgPool2d(1),
+                nn.Flatten(),
+                nn.LazyLinear(self.mlp_hidden),
+                nn.GELU(),
+                nn.Linear(self.mlp_hidden, self.num_classes),
+            )
+            self.bce_logits = nn.BCEWithLogitsLoss()
 
     def forward(self, x, mask: torch.Tensor | None = None):
         try:
@@ -99,39 +117,19 @@ class LitAutoModule(L.LightningModule):
             x_in = (x + noise).clamp(0, 1)
         # Choose mask strategy
         mask = None
+        labels = None
         use_default = bool(getattr(self.hparams, "use_default_grid_mask", True))
-        if use_default:
-            b, _, hh, ww = x_in.shape
-            mask = generate_region_mask(
-                b, hh, ww,
-                grid_h=int(getattr(self.hparams, "grid_h", 14)),
-                grid_w=int(getattr(self.hparams, "grid_w", 14)),
-                device=x_in.device,
-            )
-        else:
-            try:
-                if torch.is_tensor(y) and y.dim() >= 2:
-                    mask = y
-            except Exception:
-                mask = None
-        out = self(x_in, mask=mask)
-        loss = self._compute_loss(x, out, mask_for_loss=mask)
-        self.log("loss/train", loss, prog_bar=True, on_step=True, on_epoch=True)
-        return loss
-
-    def validation_step(self, batch, batch_idx):
-        x, y = batch
-        with torch.no_grad():
-            # Choose mask strategy
-            mask = None
-            use_default = bool(getattr(self.hparams, "use_default_grid_mask", True))
+        if isinstance(y, dict):
+            labels = y.get("labels", None)
+            mask = y.get("mask", None)
+        if mask is None:
             if use_default:
-                b, _, hh, ww = x.shape
+                b, _, hh, ww = x_in.shape
                 mask = generate_region_mask(
                     b, hh, ww,
                     grid_h=int(getattr(self.hparams, "grid_h", 14)),
                     grid_w=int(getattr(self.hparams, "grid_w", 14)),
-                    device=x.device,
+                    device=x_in.device,
                 )
             else:
                 try:
@@ -139,9 +137,88 @@ class LitAutoModule(L.LightningModule):
                         mask = y
                 except Exception:
                     mask = None
+
+        out = self(x_in, mask=mask)
+        loss_recon = self._compute_loss(x, out, mask_for_loss=mask)
+        total = loss_recon * self.recon_weight
+
+        if self.phase == 2:
+            # Middle features for classification
+            features = None
+            try:
+                rat = getattr(self.model, "rat", None) or getattr(self, "rat", None)
+                if rat is not None and hasattr(rat, "extract_middle_features"):
+                    features = rat.extract_middle_features(x_in, mask if mask is not None else generate_region_mask(x_in.size(0), x_in.size(2), x_in.size(3), device=x_in.device))
+            except Exception:
+                features = None
+            if features is None:
+                # Fallback: use reconstruction tensor as features (not ideal)
+                features = get_recon(out)
+            logits = self.cls_head(features)
+            if labels is None and isinstance(y, dict) and "labels" in y:
+                labels = y["labels"]
+            if labels is None:
+                # Try zeros if labels unavailable
+                labels = torch.zeros(x.size(0), self.num_classes, device=logits.device)
+            labels = labels.to(logits.device).float()
+            if labels.dim() == 1:
+                labels = labels.unsqueeze(0).expand(logits.size(0), -1)
+            loss_cls = self.bce_logits(logits, labels)
+            self.log("loss/cls", loss_cls, prog_bar=True, on_step=True, on_epoch=True)
+            total = total + self.cls_weight * loss_cls
+
+        self.log("loss/train", total, prog_bar=True, on_step=True, on_epoch=True)
+        return total
+
+    def validation_step(self, batch, batch_idx):
+        x, y = batch
+        with torch.no_grad():
+            # Choose mask strategy
+            mask = None
+            labels = None
+            use_default = bool(getattr(self.hparams, "use_default_grid_mask", True))
+            if isinstance(y, dict):
+                labels = y.get("labels", None)
+                mask = y.get("mask", None)
+            if mask is None:
+                if use_default:
+                    b, _, hh, ww = x.shape
+                    mask = generate_region_mask(
+                        b, hh, ww,
+                        grid_h=int(getattr(self.hparams, "grid_h", 14)),
+                        grid_w=int(getattr(self.hparams, "grid_w", 14)),
+                        device=x.device,
+                    )
+                else:
+                    try:
+                        if torch.is_tensor(y) and y.dim() >= 2:
+                            mask = y
+                    except Exception:
+                        mask = None
             out = self(x, mask=mask)
-        loss = self._compute_loss(x, out, mask_for_loss=mask)
-        self.log("loss/val", loss, prog_bar=True, on_step=False, on_epoch=True)
+        loss_recon = self._compute_loss(x, out, mask_for_loss=mask)
+        total = loss_recon * self.recon_weight
+
+        if self.phase == 2:
+            # Classification validation loss
+            try:
+                rat = getattr(self.model, "rat", None) or getattr(self, "rat", None)
+                features = rat.extract_middle_features(x, mask if mask is not None else generate_region_mask(x.size(0), x.size(2), x.size(3), device=x.device))
+                logits = self.cls_head(features)
+                if labels is None and isinstance(y, dict) and "labels" in y:
+                    labels = y["labels"]
+                if labels is None:
+                    labels = torch.zeros(x.size(0), self.num_classes, device=logits.device)
+                labels = labels.to(logits.device).float()
+                if labels.dim() == 1:
+                    labels = labels.unsqueeze(0).expand(logits.size(0), -1)
+                loss_cls = self.bce_logits(logits, labels)
+                self.log("loss/cls_val", loss_cls, prog_bar=True, on_step=False, on_epoch=True)
+                total = total + self.cls_weight * loss_cls
+            except Exception:
+                pass
+
+        self.log("loss/val", total, prog_bar=True, on_step=False, on_epoch=True)
 
         # PSNR for a quick quality signal (assuming outputs are in [0,1])
         recon = get_recon(out).clamp(0, 1)
@@ -198,6 +275,13 @@ def main():
     parser.add_argument("--grid-h", type=int, default=14, help="Grid height for default region mask")
     parser.add_argument("--grid-w", type=int, default=14, help="Grid width for default region mask")
     parser.add_argument("--seed", type=int, default=42)
+    # Phase control
+    parser.add_argument("--phase", type=int, default=1, choices=[1,2], help="Phase 1: reconstruction; Phase 2: classification+reconstruction")
+    parser.add_argument("--phase2-ckpt", type=str, default=None, help="Checkpoint path to initialize RAT weights for Phase 2")
+    parser.add_argument("--num-classes", type=int, default=14, help="Number of disease classes for CheXpert")
+    parser.add_argument("--cls-weight", type=float, default=1.0, help="Weight of classification loss in total loss")
+    parser.add_argument("--recon-weight", type=float, default=1.0, help="Weight of reconstruction loss in total loss")
+    parser.add_argument("--mlp-hidden", type=int, default=512, help="Hidden dim for MLP classification head")
 
     # CheXpert-specific options
     parser.add_argument("--chexpert-train-csv", type=str, default=r"C:\Vkev\Repos\Region-Attention-Transformer-for-Medical-Image-Restoration\data\archive\train.csv",
@@ -228,9 +312,9 @@ def main():
     parser.add_argument("--precision", type=str, default="32-true", help="e.g., 32-true, 16-mixed, bf16-mixed")
     parser.add_argument("--accumulate-grad-batches", type=int, default=1)
     parser.add_argument("--log-every-n-steps", type=int, default=50)
-    parser.add_argument("--limit-train-batches", type=float, default=1.0)
-    parser.add_argument("--limit-val-batches", type=float, default=1.0)
-    parser.add_argument("--limit-test-batches", type=float, default=1.0)
+    parser.add_argument("--limit-train-batches", type=float, default=0.001)
+    parser.add_argument("--limit-val-batches", type=float, default=0.01)
+    parser.add_argument("--limit-test-batches", type=float, default=0.01)
     parser.add_argument("--ckpt-path", type=str, default=None, help="Resume from checkpoint path")
     parser.add_argument("--output-dir", type=str, default="outputs")
     parser.add_argument("--save-samples", action="store_true", help="Save sample reconstructions each val epoch")
@@ -260,6 +344,7 @@ def main():
         chexpert_exclude_support_devices=args.chexpert_exclude_support_devices,
         chexpert_mask_dir=args.chexpert_mask_dir,
         chexpert_mask_file=args.chexpert_mask_file,
+        chexpert_return_labels=(args.phase == 2),
     )
     dm.prepare_data()
     dm.setup("fit")
@@ -316,12 +401,49 @@ def main():
         use_default_grid_mask=args.use_default_grid_mask,
         grid_h=args.grid_h,
         grid_w=args.grid_w,
+        phase=args.phase,
+        num_classes=args.num_classes,
+        cls_weight=args.cls_weight,
+        recon_weight=args.recon_weight,
+        mlp_hidden=args.mlp_hidden,
     )
     # Align example input shape with dataset
     try:
         lit.example_input_array = torch.randn(2, c, h, w)
     except Exception:
         pass
+
+    # Phase 2: optionally load checkpoint and freeze decoder
+    if args.phase == 2 and hasattr(base_model, "rat"):
+        if args.phase2_ckpt is not None:
+            try:
+                state = torch.load(args.phase2_ckpt, map_location="cpu")
+                if "state_dict" in state:
+                    # Lightning checkpoint
+                    sd = state["state_dict"]
+                    # Filter keys to RAT only
+                    rat_prefixes = ["model.rat.", "rat."]
+                    cleaned = {}
+                    for k, v in sd.items():
+                        for p in rat_prefixes:
+                            if k.startswith(p):
+                                cleaned[k[len(p):]] = v
+                    base_model.rat.load_state_dict(cleaned, strict=False)
+                else:
+                    # Plain state dict of model
+                    base_model.rat.load_state_dict(state, strict=False)
+                print(f"[phase2] Loaded RAT weights from {args.phase2_ckpt}")
+            except Exception as e:
+                print(f"[phase2] Failed to load RAT weights from {args.phase2_ckpt}: {e}")
+        # Freeze decoder, keep encoder+middle blocks trainable
+        for p in base_model.rat.decoders.parameters():
+            p.requires_grad = False
+        for p in base_model.rat.ups.parameters():
+            p.requires_grad = False
+        for p in base_model.rat.ending.parameters():
+            p.requires_grad = False
+        # Keep intro, encoders, downs, middle_blks, ending trainable
+        # (ending is small conv producing reconstruction; keep it to allow recon loss)
 
     # Callbacks
     callbacks = [
@@ -332,6 +454,8 @@ def main():
     ]
     if args.save_samples:
         callbacks.append(SavePredictionsCallback(out_dir=args.output_dir, num_samples=16))
+    if args.phase == 2:
+        callbacks.append(ClassificationAccEvalCallback(segments=10, max_eval_batches=50))
 
     trainer = L.Trainer(
         accelerator="auto",

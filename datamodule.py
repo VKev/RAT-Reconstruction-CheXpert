@@ -34,6 +34,7 @@ class ImageDataModule(L.LightningDataModule):
                  chexpert_only_support_devices: bool = False,
                  chexpert_mask_dir: Optional[str] = None,
                  chexpert_mask_file: Optional[str] = None,
+                 chexpert_return_labels: bool = False,
                  ):
         super().__init__()
         self.data_dir = data_dir
@@ -53,6 +54,7 @@ class ImageDataModule(L.LightningDataModule):
         self.chexpert_only_support_devices = chexpert_only_support_devices
         self.chexpert_mask_dir = chexpert_mask_dir
         self.chexpert_mask_file = chexpert_mask_file
+        self.chexpert_return_labels = chexpert_return_labels
 
         # Keep pixels in [0,1]; models should output [0,1] (we use Sigmoid in the default VAE).
         if self.dataset == "cifar10":
@@ -124,6 +126,7 @@ class ImageDataModule(L.LightningDataModule):
                     include_only_support_devices=self.chexpert_only_support_devices,
                     mask_dir=self.chexpert_mask_dir,
                     mask_file=self.chexpert_mask_file,
+                    return_labels=self.chexpert_return_labels,
                 )
                 self.val_set = CheXpertDataset(
                     csv_path=self.chexpert_val_csv,
@@ -138,6 +141,7 @@ class ImageDataModule(L.LightningDataModule):
                     include_only_support_devices=self.chexpert_only_support_devices,
                     mask_dir=self.chexpert_mask_dir,
                     mask_file=self.chexpert_mask_file,
+                    return_labels=self.chexpert_return_labels,
                 )
 
         if stage in (None, "test", "validate"):
@@ -159,6 +163,7 @@ class ImageDataModule(L.LightningDataModule):
                     include_only_support_devices=self.chexpert_only_support_devices,
                     mask_dir=self.chexpert_mask_dir,
                     mask_file=self.chexpert_mask_file,
+                    return_labels=self.chexpert_return_labels,
                 )
 
     def train_dataloader(self) -> DataLoader:
@@ -191,7 +196,8 @@ class CheXpertDataset(torch.utils.data.Dataset):
                  policy: str = "ones", split: Optional[str] = None,
                  train_root: Optional[str] = None, valid_root: Optional[str] = None, test_root: Optional[str] = None,
                  exclude_support_devices: bool = False, include_only_support_devices: bool = False,
-                 mask_dir: Optional[str] = None, mask_file: Optional[str] = None):
+                 mask_dir: Optional[str] = None, mask_file: Optional[str] = None,
+                 return_labels: bool = False):
         super().__init__()
         self.csv_path = csv_path
         self.root_dir = root_dir
@@ -209,6 +215,7 @@ class CheXpertDataset(torch.utils.data.Dataset):
         self.mask_dir = mask_dir
         self.mask_file = mask_file
         self.mask_mapping = None
+        self.return_labels = return_labels
 
         df = pd.read_csv(csv_path)
         self.num_rows_before_filter = len(df)
@@ -252,6 +259,13 @@ class CheXpertDataset(torch.utils.data.Dataset):
         # Keep relative paths for mask lookup
         self.rel_paths: List[str] = df["Path"].astype(str).tolist()
         self.paths: List[str] = self.rel_paths
+        # Optionally keep label matrix for classification
+        self.labels_tensor = None
+        cols_present = [c for c in self.LABEL_COLUMNS if c in df.columns]
+        if self.return_labels and cols_present:
+            import numpy as _np
+            arr = df[cols_present].values.astype(_np.float32)
+            self.labels_tensor = torch.from_numpy(arr)
         # If a single mask file is provided, load once
         if self.mask_file is not None and os.path.exists(self.mask_file):
             try:
@@ -407,8 +421,16 @@ class CheXpertDataset(torch.utils.data.Dataset):
             if mask_tensor.shape[-2:] != (h_img, w_img):
                 mask_tensor = torch.nn.functional.interpolate(mask_tensor.unsqueeze(0).unsqueeze(0).float(),
                                                                size=(h_img, w_img), mode="nearest").squeeze(0).squeeze(0).long()
-        if mask_tensor is None:
-            # Fallback: dummy label
-            return img, torch.tensor(0, dtype=torch.long)
+        if self.return_labels and self.labels_tensor is not None:
+            y_vec = self.labels_tensor[idx]
+            # return both classification labels and optional mask if present
+            if mask_tensor is None:
+                return img, {"labels": y_vec}
+            else:
+                return img, {"labels": y_vec, "mask": mask_tensor}
         else:
-            return img, mask_tensor
+            if mask_tensor is None:
+                # Fallback: dummy label
+                return img, torch.tensor(0, dtype=torch.long)
+            else:
+                return img, mask_tensor

@@ -3,6 +3,7 @@
 
 import os
 import torch
+import torch.nn.functional as F
 import lightning as L
 from torchvision.utils import save_image
 
@@ -265,3 +266,155 @@ class SavePredictionsCallback(L.Callback):
         if trainer.is_global_zero:
             print(f"[SaveReconstructionsCallback] Wrote {save_path}")
 
+
+class ClassificationAccEvalCallback(L.Callback):
+    """Evaluate classification accuracy on the test set every 1/segments of an epoch (Phase 2 only)."""
+
+    def __init__(self, segments: int = 10, max_eval_batches: int | None = None):
+        super().__init__()
+        assert segments >= 1
+        self.segments = segments
+        self.max_eval_batches = max_eval_batches
+        self._boundaries = None
+        self._segment_idx = 0
+
+    def on_train_epoch_start(self, trainer: L.Trainer, pl_module: L.LightningModule) -> None:
+        # compute batch boundaries for this epoch
+        import math
+        try:
+            num_batches = int(getattr(trainer, "num_training_batches", 0))
+        except Exception:
+            num_batches = 0
+        if not num_batches:
+            try:
+                loader = trainer.datamodule.train_dataloader() if trainer.datamodule else trainer.train_dataloader
+                num_batches = len(loader)
+            except Exception:
+                num_batches = 0
+        num_batches = max(1, num_batches)
+        boundaries = []
+        for i in range(1, self.segments + 1):
+            b = math.ceil(num_batches * (i / self.segments))
+            b = max(1, min(b, num_batches))
+            if not boundaries or b > boundaries[-1]:
+                boundaries.append(b)
+        self._boundaries = boundaries
+        self._segment_idx = 0
+
+    @torch.no_grad()
+    def _eval_cls_acc(self, trainer: L.Trainer, pl_module: L.LightningModule) -> float | None:
+        # Only valid for phase 2 with a classification head
+        if not hasattr(pl_module, "phase") or int(getattr(pl_module, "phase", 1)) != 2:
+            return None
+        if not hasattr(pl_module, "cls_head"):
+            return None
+        dm = trainer.datamodule
+        if dm is None:
+            return None
+        try:
+            dm.setup("test")
+            loader = dm.test_dataloader()
+        except Exception:
+            return None
+        if loader is None:
+            return None
+
+        device = pl_module.device
+        was_training = pl_module.training
+        pl_module.eval()
+
+        total_correct = 0.0
+        total_count = 0.0
+
+        # Helper to get mask
+        from utils import generate_region_mask
+
+        max_batches = self.max_eval_batches or len(loader)
+
+        pbar = None
+        use_pbar = False
+        if trainer.is_global_zero:
+            try:
+                from tqdm import tqdm as _tqdm
+                pbar = _tqdm(total=max_batches, desc="Phase2 test acc", leave=False)
+                use_pbar = True
+            except Exception:
+                pbar = None
+                use_pbar = False
+
+        for bi, (x, y) in enumerate(loader):
+            if bi >= max_batches:
+                break
+            try:
+                labels = None
+                mask = None
+                if isinstance(y, dict):
+                    labels = y.get("labels", None)
+                    mask = y.get("mask", None)
+                # Build default mask if missing
+                if mask is None:
+                    b, _, hh, ww = x.shape
+                    mask = generate_region_mask(b, hh, ww, grid_h=int(getattr(pl_module.hparams, "grid_h", 14)), grid_w=int(getattr(pl_module.hparams, "grid_w", 14)), device=device)
+
+                x = x.to(device)
+                if labels is None:
+                    # if labels absent, skip batch
+                    continue
+                labels = labels.to(device).float()
+
+                # Extract features from RAT middle
+                rat = getattr(pl_module.model, "rat", None)
+                if rat is None or not hasattr(rat, "extract_middle_features"):
+                    continue
+                feats = rat.extract_middle_features(x, mask)
+                logits = pl_module.cls_head(feats)
+                preds = (torch.sigmoid(logits) > 0.5).float()
+
+                if labels.dim() == 1:
+                    labels = labels.unsqueeze(0).expand_as(preds)
+                # Align batch if needed
+                if labels.shape != preds.shape:
+                    try:
+                        labels = labels[:, : preds.shape[1]]
+                    except Exception:
+                        continue
+                correct = (preds == labels).float().sum().item()
+                count = float(preds.numel())
+                total_correct += correct
+                total_count += count
+            except Exception:
+                continue
+            finally:
+                if use_pbar and pbar is not None:
+                    try:
+                        pbar.update(1)
+                    except Exception:
+                        pass
+
+        if use_pbar and pbar is not None:
+            try:
+                pbar.close()
+            except Exception:
+                pass
+
+        if was_training:
+            pl_module.train()
+
+        if total_count == 0:
+            return None
+        return float(total_correct / total_count)
+
+    def on_train_batch_end(self, trainer: L.Trainer, pl_module: L.LightningModule, outputs, batch, batch_idx: int) -> None:
+        if self._boundaries is None or self._segment_idx >= len(self._boundaries):
+            return
+        current = int(batch_idx) + 1
+        if current >= self._boundaries[self._segment_idx]:
+            acc = self._eval_cls_acc(trainer, pl_module)
+            if acc is not None:
+                try:
+                    pl_module.log("metric/cls_acc_test", acc, prog_bar=True, on_step=True, on_epoch=False)
+                except Exception:
+                    pass
+                if trainer.is_global_zero:
+                    print(f"[Eval@{current} batches] Test cls accuracy: {acc:.4f}")
+            self._segment_idx += 1

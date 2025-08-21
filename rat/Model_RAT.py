@@ -497,6 +497,29 @@ class RAT(nn.Module):
             return x 
         else:
             return self.loss_fun(x, label, mask_original) 
+    
+    @torch.no_grad()
+    def extract_middle_features(self, inp: torch.Tensor, mask_original: torch.Tensor) -> torch.Tensor:
+        """Run the network up to the end of middle blocks and return the feature map.
+
+        This returns the tensor right after adding the encoder shortcut (before any decoder/upsampling).
+        """
+        if self.img_scale > 1:
+            inp = F.interpolate(inp, scale_factor=self.img_scale, mode='bilinear')
+
+        mask = F.interpolate(mask_original.float().unsqueeze(1), scale_factor=1 / self.mask_scale, mode='nearest')
+        mask = self.correlation_mask_oneBYone(mask, -1000)
+
+        x = self.intro(inp)
+        for encoder, down in zip(self.encoders, self.downs):
+            x = encoder(x)
+            x = down(x)
+
+        shortcut = x
+        for blk in self.middle_blks:
+            x = blk(x, mask)
+        x = x + shortcut
+        return x
         
 
 if __name__ == "__main__":
