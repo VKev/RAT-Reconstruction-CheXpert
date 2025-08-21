@@ -82,6 +82,19 @@ class LitAutoModule(L.LightningModule):
             self._mask_cache[key] = m
         return m
 
+    # -----------------
+    # Logging helpers
+    # -----------------
+    def _log_both(self, base: str, value: torch.Tensor, prog_bar_step: bool = False, prog_bar_epoch: bool = False):
+        try:
+            self.log(f"{base}/step", value, prog_bar=prog_bar_step, on_step=True, on_epoch=False)
+        except Exception:
+            pass
+        try:
+            self.log(f"{base}/epoch", value, prog_bar=prog_bar_epoch, on_step=False, on_epoch=True)
+        except Exception:
+            pass
+
     def forward(self, x, mask: torch.Tensor | None = None):
         try:
             return self.model(x, mask)
@@ -117,9 +130,9 @@ class LitAutoModule(L.LightningModule):
         if self.add_kld_if_available and mu is not None and logvar is not None:
             kld = kl_divergence(mu, logvar)
             total = total + self.beta * kld
-            self.log("loss/kld", kld, prog_bar=False, on_step=True, on_epoch=True)
+            self._log_both("loss/kld", kld, prog_bar_step=False, prog_bar_epoch=False)
 
-        self.log("loss/recon", rec, prog_bar=True, on_step=True, on_epoch=True)
+        self._log_both("loss/recon", rec, prog_bar_step=True, prog_bar_epoch=True)
         return total
 
     def training_step(self, batch, batch_idx):
@@ -185,7 +198,7 @@ class LitAutoModule(L.LightningModule):
             # Compute L = [(1-y)*recon_loss + 1] / [y*recon_loss*ssim_att + 1]
             L_term = ((1.0 - y_support) * loss_recon + 1.0) / (y_support * loss_recon * ssim_att + 1.0)
             L_term_mean = L_term.mean()
-            self.log("loss/L_term", L_term_mean, prog_bar=False, on_step=True, on_epoch=True)
+            self._log_both("loss/L_term", L_term_mean, prog_bar_step=False, prog_bar_epoch=True)
             total = L_term_mean
         else:
             # Phase 1: use only reconstruction loss
@@ -224,10 +237,10 @@ class LitAutoModule(L.LightningModule):
                     pad = torch.zeros(labels.shape[0], logits.shape[1] - labels.shape[1], device=labels.device)
                     labels = torch.cat([labels, pad], dim=1)
             loss_cls = self.bce_logits(logits, labels)
-            self.log("loss/cls", loss_cls, prog_bar=True, on_step=True, on_epoch=True)
+            self._log_both("loss/cls", loss_cls, prog_bar_step=True, prog_bar_epoch=True)
             total = total + self.cls_weight * loss_cls
 
-        self.log("loss/train", total, prog_bar=True, on_step=True, on_epoch=True)
+        self._log_both("loss/train", total, prog_bar_step=True, prog_bar_epoch=True)
         return total
 
     def validation_step(self, batch, batch_idx):
@@ -281,7 +294,7 @@ class LitAutoModule(L.LightningModule):
                 y_support = torch.zeros(x.size(0), device=x.device)
             L_term = ((1.0 - y_support) * loss_recon + 1.0) / (y_support * loss_recon * ssim_att + 1.0)
             L_term_mean = L_term.mean()
-            self.log("loss/L_term_val", L_term_mean, prog_bar=False, on_step=False, on_epoch=True)
+            self._log_both("loss/L_term_val", L_term_mean, prog_bar_step=False, prog_bar_epoch=True)
             total = L_term_mean
         else:
             total = loss_recon
@@ -308,18 +321,19 @@ class LitAutoModule(L.LightningModule):
                         pad = torch.zeros(labels.shape[0], logits.shape[1] - labels.shape[1], device=labels.device)
                         labels = torch.cat([labels, pad], dim=1)
                 loss_cls = self.bce_logits(logits, labels)
-                self.log("loss/cls_val", loss_cls, prog_bar=True, on_step=False, on_epoch=True)
+                self._log_both("loss/cls_val", loss_cls, prog_bar_step=False, prog_bar_epoch=True)
                 total = total + self.cls_weight * loss_cls
             except Exception:
                 pass
 
-        self.log("loss/val", total, prog_bar=True, on_step=False, on_epoch=True)
+        # Log both batch-level (for step plots) and epoch-level aggregation
+        self._log_both("loss/val", total, prog_bar_step=False, prog_bar_epoch=True)
 
         # PSNR for a quick quality signal (assuming outputs are in [0,1])
         recon = get_recon(out).clamp(0, 1)
         mse = F.mse_loss(recon, x, reduction="none").mean(dim=(1,2,3))
         psnr = -10.0 * torch.log10(mse + 1e-8)
-        self.log("metric/psnr", psnr.mean(), prog_bar=True, on_step=False, on_epoch=True)
+        self._log_both("metric/psnr", psnr.mean(), prog_bar_step=False, prog_bar_epoch=True)
 
     def configure_optimizers(self):
         return torch.optim.AdamW(self.parameters(), lr=self.hparams.lr)
