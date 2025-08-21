@@ -157,39 +157,38 @@ class LitAutoModule(L.LightningModule):
         out = self(x_in, mask=mask)
         # Reconstruction loss as before (rec)
         loss_recon = self._compute_loss(x, out, mask_for_loss=mask)
-        # SSIM-based adaptive weighting term
-        with torch.no_grad():
-            recon = get_recon(out).clamp(0, 1)
-            ssim_val = ssim_tensor(recon, x)
-            ssim_att = (ssim_val + 1.0) / 2.0  # [-1,1] -> [0,1]
-        # y_support: 1 if Support Devices else 0 (phase 2 expects labels)
-        y_support = None
-        if isinstance(y, dict) and (labels is not None):
-            # Try to locate the Support Devices column: last index if name present
-            try:
-                # labels shape: [B, C]
-                # assume order from dataset; find index by name if provided via datamodule mapping
-                idx = None
+        if self.phase == 2:
+            # SSIM-based adaptive weighting term
+            with torch.no_grad():
+                recon = get_recon(out).clamp(0, 1)
+                ssim_val = ssim_tensor(recon, x)
+                ssim_att = (ssim_val + 1.0) / 2.0  # [-1,1] -> [0,1]
+            # y_support: 1 if Support Devices else 0 (phase 2 expects labels)
+            y_support = None
+            if isinstance(y, dict) and (labels is not None):
                 try:
-                    dm = getattr(self.trainer, 'datamodule', None)
-                    if dm is not None and hasattr(dm, 'train_set') and hasattr(dm.train_set, 'labels_index_map'):
-                        idx = dm.train_set.labels_index_map.get('Support Devices', None)
-                except Exception:
                     idx = None
-                if idx is None:
-                    # Fallback: try last column
-                    idx = labels.size(1) - 1
-                y_support = (labels[:, idx] > 0.5).float()
-            except Exception:
-                y_support = None
-        # If no labels or not in phase2, default y_support=0
-        if y_support is None:
-            y_support = torch.zeros(x.size(0), device=x.device)
-        # Compute L = [(1-y)*recon_loss + 1] / [y*recon_loss*ssim_att + 1]
-        L_term = ((1.0 - y_support) * loss_recon + 1.0) / (y_support * loss_recon * ssim_att + 1.0)
-        L_term_mean = L_term.mean()
-        self.log("loss/L_term", L_term_mean, prog_bar=False, on_step=True, on_epoch=True)
-        total = L_term_mean
+                    try:
+                        dm = getattr(self.trainer, 'datamodule', None)
+                        if dm is not None and hasattr(dm, 'train_set') and hasattr(dm.train_set, 'labels_index_map'):
+                            idx = dm.train_set.labels_index_map.get('Support Devices', None)
+                    except Exception:
+                        idx = None
+                    if idx is None:
+                        idx = labels.size(1) - 1
+                    y_support = (labels[:, idx] > 0.5).float()
+                except Exception:
+                    y_support = None
+            if y_support is None:
+                y_support = torch.zeros(x.size(0), device=x.device)
+            # Compute L = [(1-y)*recon_loss + 1] / [y*recon_loss*ssim_att + 1]
+            L_term = ((1.0 - y_support) * loss_recon + 1.0) / (y_support * loss_recon * ssim_att + 1.0)
+            L_term_mean = L_term.mean()
+            self.log("loss/L_term", L_term_mean, prog_bar=False, on_step=True, on_epoch=True)
+            total = L_term_mean
+        else:
+            # Phase 1: use only reconstruction loss
+            total = loss_recon
 
         if self.phase == 2:
             # Middle features for classification
@@ -257,31 +256,34 @@ class LitAutoModule(L.LightningModule):
                 pass
             out = self(x, mask=mask)
         loss_recon = self._compute_loss(x, out, mask_for_loss=mask)
-        with torch.no_grad():
-            recon = get_recon(out).clamp(0, 1)
-            ssim_val = ssim_tensor(recon, x)
-            ssim_att = (ssim_val + 1.0) / 2.0
-        y_support = None
-        if isinstance(y, dict) and (labels is not None):
-            try:
-                idx = None
+        if self.phase == 2:
+            with torch.no_grad():
+                recon = get_recon(out).clamp(0, 1)
+                ssim_val = ssim_tensor(recon, x)
+                ssim_att = (ssim_val + 1.0) / 2.0
+            y_support = None
+            if isinstance(y, dict) and (labels is not None):
                 try:
-                    dm = getattr(self.trainer, 'datamodule', None)
-                    if dm is not None and hasattr(dm, 'train_set') and hasattr(dm.train_set, 'labels_index_map'):
-                        idx = dm.train_set.labels_index_map.get('Support Devices', None)
-                except Exception:
                     idx = None
-                if idx is None:
-                    idx = labels.size(1) - 1
-                y_support = (labels[:, idx] > 0.5).float()
-            except Exception:
-                y_support = None
-        if y_support is None:
-            y_support = torch.zeros(x.size(0), device=x.device)
-        L_term = ((1.0 - y_support) * loss_recon + 1.0) / (y_support * loss_recon * ssim_att + 1.0)
-        L_term_mean = L_term.mean()
-        self.log("loss/L_term_val", L_term_mean, prog_bar=False, on_step=False, on_epoch=True)
-        total = L_term_mean
+                    try:
+                        dm = getattr(self.trainer, 'datamodule', None)
+                        if dm is not None and hasattr(dm, 'train_set') and hasattr(dm.train_set, 'labels_index_map'):
+                            idx = dm.train_set.labels_index_map.get('Support Devices', None)
+                    except Exception:
+                        idx = None
+                    if idx is None:
+                        idx = labels.size(1) - 1
+                    y_support = (labels[:, idx] > 0.5).float()
+                except Exception:
+                    y_support = None
+            if y_support is None:
+                y_support = torch.zeros(x.size(0), device=x.device)
+            L_term = ((1.0 - y_support) * loss_recon + 1.0) / (y_support * loss_recon * ssim_att + 1.0)
+            L_term_mean = L_term.mean()
+            self.log("loss/L_term_val", L_term_mean, prog_bar=False, on_step=False, on_epoch=True)
+            total = L_term_mean
+        else:
+            total = loss_recon
 
         if self.phase == 2:
             # Classification validation loss
@@ -362,6 +364,9 @@ def main():
     # RAT hyperparameters (declare upfront to avoid unrecognized args)
     parser.add_argument("--rat-width", type=int, default=64, help="Base channel width for RAT")
     parser.add_argument("--rat-skip-strength", type=float, default=1.0, help="Strength multiplier for decoder skip connections (0 disables skips)")
+    parser.add_argument("--rat-middle-blk-num", type=int, default=6, help="Total basic layers in the middle stage (multiple of 3)")
+    parser.add_argument("--rat-enc-depths", type=str, default="1,1", help="Comma-separated depths per encoder stage, e.g., '1,1'")
+    parser.add_argument("--rat-dec-depths", type=str, default="1,1", help="Comma-separated depths per decoder stage, e.g., '1,1'")
     # Default mask options
     parser.add_argument("--use-default-grid-mask", action="store_true", help="Use default 14x14 region mask for training/validation")
     parser.add_argument("--grid-h", type=int, default=14, help="Grid height for default region mask")
@@ -464,10 +469,15 @@ def main():
     if (c, h, w) == (3, 224, 224):
         # Wrap RAT to auto-generate a simple region mask per image
         class RATWrapper(nn.Module):
-            def __init__(self, rat_width: int = 64, rat_skip_strength: float = 1.0):
+            def __init__(self, rat_width: int = 64, rat_skip_strength: float = 1.0,
+                         middle_blk_num: int = 6, enc_depths: list[int] | None = None, dec_depths: list[int] | None = None):
                 super().__init__()
-                self.rat = RAT(scale=1, img_channel=3, width=rat_width, middle_blk_num=12,
-                                enc_blk_nums=[2, 2], dec_blk_nums=[2, 2], loss_fun=None,
+                if enc_depths is None:
+                    enc_depths = [1, 1]
+                if dec_depths is None:
+                    dec_depths = [1, 1]
+                self.rat = RAT(scale=1, img_channel=3, width=rat_width, middle_blk_num=middle_blk_num,
+                                enc_blk_nums=enc_depths, dec_blk_nums=dec_depths, loss_fun=None,
                                 skip_connection_strength=rat_skip_strength)
 
             def forward(self, x):
@@ -479,7 +489,20 @@ def main():
                     mask = generate_region_mask(b, hh, ww, grid_h=14, grid_w=14, device=x.device)
                 return self.rat(x, mask)
 
-        base_model = RATWrapper(rat_width=args.rat_width, rat_skip_strength=args.rat_skip_strength)
+        # Parse depths
+        try:
+            enc_depths = [int(x) for x in str(args.rat_enc_depths).split(',') if x.strip() != '']
+        except Exception:
+            enc_depths = [1, 1]
+        try:
+            dec_depths = [int(x) for x in str(args.rat_dec_depths).split(',') if x.strip() != '']
+        except Exception:
+            dec_depths = [1, 1]
+        base_model = RATWrapper(rat_width=args.rat_width,
+                                rat_skip_strength=args.rat_skip_strength,
+                                middle_blk_num=int(args.rat_middle_blk_num),
+                                enc_depths=enc_depths,
+                                dec_depths=dec_depths)
     else:
         base_model = SmallVAE(latent_dim=128)
 

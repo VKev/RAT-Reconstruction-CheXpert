@@ -60,16 +60,41 @@ def find_latest_best_ckpt(root_dir: str = "outputs") -> Optional[str]:
     return candidates[0]
 
 
-def build_base_model(dataset: str, rat_width: int = 64, rat_skip_strength: float = 1.0) -> nn.Module:
+def build_base_model(
+    dataset: str,
+    rat_width: int = 64,
+    rat_skip_strength: float = 1.0,
+    rat_middle_blk_num: int = 6,
+    rat_enc_depths: list[int] | None = None,
+    rat_dec_depths: list[int] | None = None,
+) -> nn.Module:
     """Build the appropriate model based on dataset."""
     if dataset in ("flowers102", "chexpert"):
         # RAT wrapper for flowers102 (224x224x3)
         class RATWrapper(nn.Module):
-            def __init__(self, rat_width: int = 64, rat_skip_strength: float = 1.0):
+            def __init__(
+                self,
+                rat_width: int = 64,
+                rat_skip_strength: float = 1.0,
+                middle_blk_num: int = 6,
+                enc_depths: list[int] | None = None,
+                dec_depths: list[int] | None = None,
+            ):
                 super().__init__()
-                self.rat = RAT(scale=1, img_channel=3, width=rat_width, middle_blk_num=12,
-                                enc_blk_nums=[2, 2], dec_blk_nums=[2, 2], loss_fun=None,
-                                skip_connection_strength=rat_skip_strength)
+                if enc_depths is None:
+                    enc_depths = [1, 1]
+                if dec_depths is None:
+                    dec_depths = [1, 1]
+                self.rat = RAT(
+                    scale=1,
+                    img_channel=3,
+                    width=rat_width,
+                    middle_blk_num=middle_blk_num,
+                    enc_blk_nums=enc_depths,
+                    dec_blk_nums=dec_depths,
+                    loss_fun=None,
+                    skip_connection_strength=rat_skip_strength,
+                )
 
             def forward(self, x):
                 b, _, hh, ww = x.shape
@@ -77,7 +102,13 @@ def build_base_model(dataset: str, rat_width: int = 64, rat_skip_strength: float
                 mask = generate_region_mask(b, hh, ww, grid_h=14, grid_w=14, device=x.device)
                 return self.rat(x, mask)
         
-        return RATWrapper(rat_width=rat_width, rat_skip_strength=rat_skip_strength)
+        return RATWrapper(
+            rat_width=rat_width,
+            rat_skip_strength=rat_skip_strength,
+            middle_blk_num=rat_middle_blk_num,
+            enc_depths=rat_enc_depths,
+            dec_depths=rat_dec_depths,
+        )
     else:
         # SmallVAE for CIFAR-10 (32x32x3)
         return SmallVAE(latent_dim=128)
@@ -96,6 +127,9 @@ def main():
     parser.add_argument("--num-samples", type=int, default=2)
     parser.add_argument("--rat-width", type=int, default=64, help="Base channel width for RAT")
     parser.add_argument("--rat-skip-strength", type=float, default=1.0, help="Strength multiplier for decoder skip connections (0 disables skips)")
+    parser.add_argument("--rat-middle-blk-num", type=int, default=6, help="Total basic layers in the middle stage (multiple of 3)")
+    parser.add_argument("--rat-enc-depths", type=str, default="1,1", help="Comma-separated depths per encoder stage, e.g., '1,1'")
+    parser.add_argument("--rat-dec-depths", type=str, default="1,1", help="Comma-separated depths per decoder stage, e.g., '1,1'")
     parser.add_argument("--output-dir", type=str, default="outputs/visualize")
     parser.add_argument("--seed", type=int, default=42)
 
@@ -150,7 +184,24 @@ def main():
     print(f"[visualize] Using checkpoint: {ckpt_path}")
 
     # Build base model and Lightning module, then load weights
-    base_model = build_base_model(args.dataset, rat_width=args.rat_width, rat_skip_strength=args.rat_skip_strength)
+    # Parse depths
+    try:
+        enc_depths = [int(x) for x in str(args.rat_enc_depths).split(',') if x.strip() != '']
+    except Exception:
+        enc_depths = [1, 1]
+    try:
+        dec_depths = [int(x) for x in str(args.rat_dec_depths).split(',') if x.strip() != '']
+    except Exception:
+        dec_depths = [1, 1]
+
+    base_model = build_base_model(
+        args.dataset,
+        rat_width=args.rat_width,
+        rat_skip_strength=args.rat_skip_strength,
+        rat_middle_blk_num=args.rat_middle_blk_num,
+        rat_enc_depths=enc_depths,
+        rat_dec_depths=dec_depths,
+    )
 
     lit: LitAutoModule = LitAutoModule.load_from_checkpoint(ckpt_path, model=base_model, map_location=device)
     lit.eval()
