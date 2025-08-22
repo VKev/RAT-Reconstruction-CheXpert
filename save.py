@@ -277,6 +277,11 @@ class ClassificationAccEvalCallback(L.Callback):
         self.max_eval_batches = max_eval_batches
         self._boundaries = None
         self._segment_idx = 0
+        # Metrics accumulators
+        self._sum_correct = 0.0
+        self._sum_count = 0.0
+        self._auroc_scores = []
+        self._f1_scores = []
 
     def on_train_epoch_start(self, trainer: L.Trainer, pl_module: L.LightningModule) -> None:
         # compute batch boundaries for this epoch
@@ -300,9 +305,13 @@ class ClassificationAccEvalCallback(L.Callback):
                 boundaries.append(b)
         self._boundaries = boundaries
         self._segment_idx = 0
+        self._sum_correct = 0.0
+        self._sum_count = 0.0
+        self._auroc_scores = []
+        self._f1_scores = []
 
     @torch.no_grad()
-    def _eval_cls_acc(self, trainer: L.Trainer, pl_module: L.LightningModule) -> float | None:
+    def _eval_cls_acc(self, trainer: L.Trainer, pl_module: L.LightningModule) -> dict | None:
         # Only valid for phase 2 with a classification head
         if not hasattr(pl_module, "phase") or int(getattr(pl_module, "phase", 1)) != 2:
             return None
@@ -325,6 +334,8 @@ class ClassificationAccEvalCallback(L.Callback):
 
         total_correct = 0.0
         total_count = 0.0
+        all_logits = []
+        all_labels = []
 
         # Helper to get mask
         from utils import generate_region_mask
@@ -368,7 +379,8 @@ class ClassificationAccEvalCallback(L.Callback):
                     continue
                 feats = rat.extract_middle_features(x, mask)
                 logits = pl_module.cls_head(feats)
-                preds = (torch.sigmoid(logits) > 0.5).float()
+                probs = torch.sigmoid(logits)
+                preds = (probs > 0.5).float()
 
                 if labels.dim() == 1:
                     labels = labels.unsqueeze(0)
@@ -384,6 +396,9 @@ class ClassificationAccEvalCallback(L.Callback):
                 count = float(preds.numel())
                 total_correct += correct
                 total_count += count
+                # Collect for AUROC/F1
+                all_logits.append(probs.detach().cpu())
+                all_labels.append(labels.detach().cpu())
             except Exception:
                 continue
             finally:
@@ -404,19 +419,55 @@ class ClassificationAccEvalCallback(L.Callback):
 
         if total_count == 0:
             return None
-        return float(total_correct / total_count)
+        acc = float(total_correct / total_count)
+        # Compute AUROC and F1 (macro) if possible
+        auroc_macro = None
+        f1_macro = None
+        try:
+            import numpy as _np
+            from sklearn.metrics import roc_auc_score, f1_score
+            y_true = torch.cat(all_labels, dim=0).numpy()
+            y_prob = torch.cat(all_logits, dim=0).numpy()
+            # Handle classes with constant labels by ignoring errors
+            with _np.errstate(all='ignore'):
+                aurocs = []
+                for ci in range(y_true.shape[1]):
+                    yt = y_true[:, ci]
+                    yp = y_prob[:, ci]
+                    if (yt.max() == yt.min()):
+                        continue
+                    try:
+                        aurocs.append(roc_auc_score(yt, yp))
+                    except Exception:
+                        pass
+                auroc_macro = float(_np.mean(aurocs)) if len(aurocs) > 0 else None
+            # F1 with threshold 0.5
+            y_pred = (y_prob > 0.5).astype('float32')
+            f1_macro = float(f1_score(y_true, y_pred, average='macro', zero_division=0))
+        except Exception:
+            pass
+        return {"acc": acc, "auroc_macro": auroc_macro, "f1_macro": f1_macro}
 
     def on_train_batch_end(self, trainer: L.Trainer, pl_module: L.LightningModule, outputs, batch, batch_idx: int) -> None:
         if self._boundaries is None or self._segment_idx >= len(self._boundaries):
             return
         current = int(batch_idx) + 1
         if current >= self._boundaries[self._segment_idx]:
-            acc = self._eval_cls_acc(trainer, pl_module)
-            if acc is not None:
+            metrics = self._eval_cls_acc(trainer, pl_module)
+            if metrics is not None:
                 try:
-                    pl_module.log("metric/cls_acc_test", acc, prog_bar=True, on_step=True, on_epoch=False)
+                    pl_module.log("metric/test/acc", metrics["acc"], prog_bar=True, on_step=True, on_epoch=False)
+                    if metrics.get("auroc_macro", None) is not None:
+                        pl_module.log("metric/test/auroc_macro", metrics["auroc_macro"], prog_bar=False, on_step=True, on_epoch=False)
+                    if metrics.get("f1_macro", None) is not None:
+                        pl_module.log("metric/test/f1_macro", metrics["f1_macro"], prog_bar=False, on_step=True, on_epoch=False)
                 except Exception:
                     pass
                 if trainer.is_global_zero:
-                    print(f"[Eval@{current} batches] Test cls accuracy: {acc:.4f}")
+                    msg = f"[Eval@{current} batches] Test acc: {metrics['acc']:.4f}"
+                    if metrics.get("auroc_macro", None) is not None:
+                        msg += f", AUROC-macro: {metrics['auroc_macro']:.4f}"
+                    if metrics.get("f1_macro", None) is not None:
+                        msg += f", F1-macro: {metrics['f1_macro']:.4f}"
+                    print(msg)
             self._segment_idx += 1

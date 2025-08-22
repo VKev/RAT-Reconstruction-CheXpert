@@ -2,3 +2,5 @@ simpleitk
 pandas
 lightning
 wandb
+torchmetrics
+scikit-learn
