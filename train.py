@@ -582,7 +582,7 @@ def main():
 
     # Callbacks
     callbacks = [
-        ModelCheckpoint(monitor="loss/val", mode="min", save_top_k=1, filename="best-{epoch:02d}"),
+        ModelCheckpoint(monitor="loss/val/epoch", mode="min", save_top_k=1, filename="best-{epoch:02d}"),
         SegmentedBestCheckpointCallback(segments=10),
         LearningRateMonitor(logging_interval="step"),
         TQDMProgressBar(),
