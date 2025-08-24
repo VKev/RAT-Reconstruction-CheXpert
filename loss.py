@@ -5,6 +5,7 @@ from typing import Any
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 class FocalRegionLoss(nn.Module):
@@ -60,6 +61,62 @@ class FocalRegionLoss(nn.Module):
 
         return torch.mean(loss_metric * (weight * self.beta + 1.0))
 
+
+class MultiLabelFocalLossWithLogits(nn.Module):
+    """Focal loss for multi-label classification with logits.
+
+    Computes per-class BCEWithLogits, modulated by (1 - p_t)^gamma and optional alpha balancing.
+
+    Args:
+        alpha: class balancing factor. If float in [0,1], used as foreground weight per class.
+               If a tensor of shape [C], broadcast across batch. If None, no alpha term.
+        gamma: focusing parameter >= 0.
+        reduction: 'none' | 'mean' | 'sum'
+        eps: numerical stability for probabilities.
+    """
+
+    def __init__(self, alpha: float | torch.Tensor | None = 0.25, gamma: float = 2.0,
+                 reduction: str = "mean", eps: float = 1e-6) -> None:
+        super().__init__()
+        if isinstance(alpha, torch.Tensor):
+            self.register_buffer("alpha", alpha.clone().detach())
+        else:
+            self.alpha = alpha  # type: ignore[assignment]
+        self.gamma = float(gamma)
+        self.reduction = reduction
+        self.eps = float(eps)
+
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        targets = targets.float()
+        # BCE with logits per element
+        bce = F.binary_cross_entropy_with_logits(logits, targets, reduction="none")
+        # Probabilities for modulating factor
+        prob = torch.sigmoid(logits).clamp(self.eps, 1.0 - self.eps)
+        p_t = prob * targets + (1.0 - prob) * (1.0 - targets)
+        modulating = (1.0 - p_t) ** self.gamma
+
+        loss = modulating * bce
+
+        if self.alpha is not None:
+            if isinstance(self.alpha, torch.Tensor):
+                # alpha per class: shape [C] -> broadcast to [B, C]
+                while self.alpha.dim() < loss.dim():
+                    alpha_t = self.alpha
+                    self.alpha = alpha_t
+                alpha_t = self.alpha
+                # Broadcast to logits shape
+                for _ in range(loss.dim() - alpha_t.dim()):
+                    alpha_t = alpha_t.unsqueeze(0)
+                alpha_factor = alpha_t * targets + (1.0 - alpha_t) * (1.0 - targets)
+            else:
+                alpha_factor = self.alpha * targets + (1.0 - self.alpha) * (1.0 - targets)
+            loss = alpha_factor * loss
+
+        if self.reduction == "mean":
+            return loss.mean()
+        if self.reduction == "sum":
+            return loss.sum()
+        return loss
 
 def kl_divergence(mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
     """KL divergence term for VAEs.

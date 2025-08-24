@@ -525,6 +525,29 @@ class RAT(nn.Module):
             x = blk(x, mask)
         x = x + shortcut
         return x
+
+    @torch.no_grad()
+    def extract_pre_post_features(self, inp: torch.Tensor, mask_original: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return both the feature before middle blocks (encoder output) and after middle blocks.
+
+        Shapes: both tensors are [B, C, H/scale, W/scale] at the bottleneck resolution.
+        """
+        if self.img_scale > 1:
+            inp = F.interpolate(inp, scale_factor=self.img_scale, mode='bilinear')
+
+        mask = F.interpolate(mask_original.float().unsqueeze(1), scale_factor=1 / self.mask_scale, mode='nearest')
+        mask = self.correlation_mask_oneBYone(mask, -1000)
+
+        x = self.intro(inp)
+        for encoder, down in zip(self.encoders, self.downs):
+            x = encoder(x)
+            x = down(x)
+
+        pre_middle = x
+        for blk in self.middle_blks:
+            x = blk(x, mask)
+        post_middle = x + pre_middle
+        return pre_middle, post_middle
         
 
 if __name__ == "__main__":

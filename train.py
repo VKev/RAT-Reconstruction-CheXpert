@@ -13,7 +13,7 @@ from lightning.pytorch.loggers import WandbLogger
 from datamodule import ImageDataModule
 from model import SmallVAE
 from rat.Model_RAT import RAT
-from loss import make_criterion, kl_divergence, FocalRegionLoss
+from loss import make_criterion, kl_divergence, FocalRegionLoss, MultiLabelFocalLossWithLogits
 from save import SavePredictionsCallback, SegmentedBestCheckpointCallback, ClassificationAccEvalCallback
 from utils import get_recon, generate_region_mask, ssim_tensor
 
@@ -40,7 +40,7 @@ class LitAutoModule(L.LightningModule):
                  input_noise_std: float = 0.0,
                  use_default_grid_mask: bool = True, grid_h: int = 14, grid_w: int = 14,
                  phase: int = 1, num_classes: int = 14, cls_weight: float = 1.0, recon_weight: float = 1.0,
-                 mlp_hidden: int = 512):
+                 mlp_hidden: int = 512, mlp_dropout: float = 0.2):
         super().__init__()
         self.model = model
         self.save_hyperparameters(ignore=["model"])
@@ -55,16 +55,12 @@ class LitAutoModule(L.LightningModule):
         self.cls_weight = float(cls_weight)
         self.recon_weight = float(recon_weight)
         self.mlp_hidden = int(mlp_hidden)
+        self.mlp_dropout = float(mlp_dropout)
         if self.phase == 2:
-            # Classification head: lazy inference of input dim
-            self.cls_head = nn.Sequential(
-                nn.AdaptiveAvgPool2d(1),
-                nn.Flatten(),
-                nn.LazyLinear(self.mlp_hidden),
-                nn.GELU(),
-                nn.Linear(self.mlp_hidden, self.num_classes),
-            )
-            self.bce_logits = nn.BCEWithLogitsLoss()
+            # Classification head will be built dynamically on first batch based on input channels
+            self._cls_head = None  # type: ignore[attr-defined]
+            # Focal loss for imbalanced multi-label classification
+            self.cls_loss = MultiLabelFocalLossWithLogits(alpha=0.25, gamma=2.0, reduction="mean")
         # Cache for default grid masks per (device,b,h,w,grid_h,grid_w)
         self._mask_cache: dict[tuple, torch.Tensor] = {}
 
@@ -171,52 +167,39 @@ class LitAutoModule(L.LightningModule):
         out = self(x_in, mask=mask)
         # Reconstruction loss as before (rec)
         loss_recon = self._compute_loss(x, out, mask_for_loss=mask)
-        if self.phase == 2:
-            # SSIM-based adaptive weighting term
-            with torch.no_grad():
-                recon = get_recon(out).clamp(0, 1)
-                ssim_val = ssim_tensor(recon, x)
-                ssim_att = (ssim_val + 1.0) / 2.0  # [-1,1] -> [0,1]
-            # y_support: 1 if Support Devices else 0 (phase 2 expects labels)
-            y_support = None
-            if isinstance(y, dict) and (labels is not None):
-                try:
-                    idx = None
-                    try:
-                        dm = getattr(self.trainer, 'datamodule', None)
-                        if dm is not None and hasattr(dm, 'train_set') and hasattr(dm.train_set, 'labels_index_map'):
-                            idx = dm.train_set.labels_index_map.get('Support Devices', None)
-                    except Exception:
-                        idx = None
-                    if idx is None:
-                        idx = labels.size(1) - 1
-                    y_support = (labels[:, idx] > 0.5).float()
-                except Exception:
-                    y_support = None
-            if y_support is None:
-                y_support = torch.zeros(x.size(0), device=x.device)
-            # Compute L = [(1-y)*recon_loss + 1] / [y*recon_loss*ssim_att + 1]
-            L_term = ((1.0 - y_support) * loss_recon + 1.0) / (y_support * loss_recon * ssim_att + 1.0)
-            L_term_mean = L_term.mean()
-            self._log_both("loss/L_term", L_term_mean, prog_bar_step=False, prog_bar_epoch=True)
-            total = L_term_mean
-        else:
-            # Phase 1: use only reconstruction loss
-            total = loss_recon
+        total = loss_recon if self.phase == 1 else torch.tensor(0.0, device=x.device)
 
         if self.phase == 2:
             # Middle features for classification
             features = None
             try:
                 rat = getattr(self.model, "rat", None) or getattr(self, "rat", None)
-                if rat is not None and hasattr(rat, "extract_middle_features"):
+                if rat is not None and hasattr(rat, "extract_pre_post_features"):
+                    pre_f, post_f = rat.extract_pre_post_features(x_in, mask if mask is not None else generate_region_mask(x_in.size(0), x_in.size(2), x_in.size(3), device=x_in.device))
+                    # Concatenate along channel dimension
+                    features = torch.cat([pre_f, post_f], dim=1)
+                elif rat is not None and hasattr(rat, "extract_middle_features"):
                     features = rat.extract_middle_features(x_in, mask if mask is not None else generate_region_mask(x_in.size(0), x_in.size(2), x_in.size(3), device=x_in.device))
             except Exception:
                 features = None
             if features is None:
                 # Fallback: use reconstruction tensor as features (not ideal)
                 features = get_recon(out)
-            logits = self.cls_head(features)
+            # Build classification head on first use to match concatenated channel count (no LazyLinear)
+            if getattr(self, "_cls_head", None) is None:
+                in_ch = int(features.size(1))
+                self._cls_head = nn.Sequential(
+                    nn.AdaptiveAvgPool2d(1),
+                    nn.Flatten(),
+                    nn.Linear(in_ch, 256),
+                    nn.GELU(),
+                    nn.Dropout(self.mlp_dropout),
+                    nn.Linear(256, 256),
+                    nn.GELU(),
+                    nn.Dropout(self.mlp_dropout),
+                    nn.Linear(256, self.num_classes),
+                ).to(features.device)
+            logits = self._cls_head(features)
             if labels is None and isinstance(y, dict) and "labels" in y:
                 labels = y["labels"]
             if labels is None:
@@ -236,9 +219,10 @@ class LitAutoModule(L.LightningModule):
                 else:
                     pad = torch.zeros(labels.shape[0], logits.shape[1] - labels.shape[1], device=labels.device)
                     labels = torch.cat([labels, pad], dim=1)
-            loss_cls = self.bce_logits(logits, labels)
+            loss_cls = self.cls_loss(logits, labels)
             self._log_both("loss/cls", loss_cls, prog_bar_step=True, prog_bar_epoch=True)
-            total = total + self.cls_weight * loss_cls
+            # Weighted combination for phase 2
+            total = self.recon_weight * loss_recon + self.cls_weight * loss_cls
 
         self._log_both("loss/train", total, prog_bar_step=True, prog_bar_epoch=True)
         return total
@@ -270,41 +254,32 @@ class LitAutoModule(L.LightningModule):
                 pass
             out = self(x, mask=mask)
         loss_recon = self._compute_loss(x, out, mask_for_loss=mask)
-        if self.phase == 2:
-            with torch.no_grad():
-                recon = get_recon(out).clamp(0, 1)
-                ssim_val = ssim_tensor(recon, x)
-                ssim_att = (ssim_val + 1.0) / 2.0
-            y_support = None
-            if isinstance(y, dict) and (labels is not None):
-                try:
-                    idx = None
-                    try:
-                        dm = getattr(self.trainer, 'datamodule', None)
-                        if dm is not None and hasattr(dm, 'train_set') and hasattr(dm.train_set, 'labels_index_map'):
-                            idx = dm.train_set.labels_index_map.get('Support Devices', None)
-                    except Exception:
-                        idx = None
-                    if idx is None:
-                        idx = labels.size(1) - 1
-                    y_support = (labels[:, idx] > 0.5).float()
-                except Exception:
-                    y_support = None
-            if y_support is None:
-                y_support = torch.zeros(x.size(0), device=x.device)
-            L_term = ((1.0 - y_support) * loss_recon + 1.0) / (y_support * loss_recon * ssim_att + 1.0)
-            L_term_mean = L_term.mean()
-            self._log_both("loss/L_term_val", L_term_mean, prog_bar_step=False, prog_bar_epoch=True)
-            total = L_term_mean
-        else:
-            total = loss_recon
+        total = loss_recon if self.phase == 1 else torch.tensor(0.0, device=x.device)
 
         if self.phase == 2:
             # Classification validation loss
             try:
                 rat = getattr(self.model, "rat", None) or getattr(self, "rat", None)
-                features = rat.extract_middle_features(x, mask if mask is not None else generate_region_mask(x.size(0), x.size(2), x.size(3), device=x.device))
-                logits = self.cls_head(features)
+                if rat is not None and hasattr(rat, "extract_pre_post_features"):
+                    pre_f, post_f = rat.extract_pre_post_features(x, mask if mask is not None else generate_region_mask(x.size(0), x.size(2), x.size(3), device=x.device))
+                    features = torch.cat([pre_f, post_f], dim=1)
+                else:
+                    features = rat.extract_middle_features(x, mask if mask is not None else generate_region_mask(x.size(0), x.size(2), x.size(3), device=x.device))
+                # Ensure head exists and matches channel count
+                if getattr(self, "_cls_head", None) is None:
+                    in_ch = int(features.size(1))
+                    self._cls_head = nn.Sequential(
+                        nn.AdaptiveAvgPool2d(1),
+                        nn.Flatten(),
+                        nn.Linear(in_ch, 256),
+                        nn.GELU(),
+                        nn.Dropout(self.mlp_dropout),
+                        nn.Linear(256, 256),
+                        nn.GELU(),
+                        nn.Dropout(self.mlp_dropout),
+                        nn.Linear(256, self.num_classes),
+                    ).to(features.device)
+                logits = self._cls_head(features)
                 if labels is None and isinstance(y, dict) and "labels" in y:
                     labels = y["labels"]
                 if labels is None:
@@ -320,9 +295,9 @@ class LitAutoModule(L.LightningModule):
                     else:
                         pad = torch.zeros(labels.shape[0], logits.shape[1] - labels.shape[1], device=labels.device)
                         labels = torch.cat([labels, pad], dim=1)
-                loss_cls = self.bce_logits(logits, labels)
+                loss_cls = self.cls_loss(logits, labels)
                 self._log_both("loss/cls_val", loss_cls, prog_bar_step=False, prog_bar_epoch=True)
-                total = total + self.cls_weight * loss_cls
+                total = self.recon_weight * loss_recon + self.cls_weight * loss_cls
             except Exception:
                 pass
 
@@ -391,9 +366,10 @@ def main():
     parser.add_argument("--phase", type=int, default=1, choices=[1,2], help="Phase 1: reconstruction; Phase 2: classification+reconstruction")
     parser.add_argument("--phase2-ckpt", type=str, default=None, help="Checkpoint path to initialize RAT weights for Phase 2")
     parser.add_argument("--num-classes", type=int, default=14, help="Number of disease classes for CheXpert")
-    parser.add_argument("--cls-weight", type=float, default=1.0, help="Weight of classification loss in total loss")
-    parser.add_argument("--recon-weight", type=float, default=1.0, help="Weight of reconstruction loss in total loss")
-    parser.add_argument("--mlp-hidden", type=int, default=512, help="Hidden dim for MLP classification head")
+    parser.add_argument("--cls-weight", type=float, default=0.8, help="[Phase 2] Weight of classification loss in total loss")
+    parser.add_argument("--recon-weight", type=float, default=0.2, help="[Phase 2] Weight of reconstruction loss in total loss")
+    parser.add_argument("--mlp-hidden", type=int, default=512, help="Hidden dim for MLP classification head (unused when using 2x256)")
+    parser.add_argument("--mlp-dropout", type=float, default=0.2, help="Dropout for MLP classification head in phase 2")
 
     # CheXpert-specific options
     parser.add_argument("--chexpert-train-csv", type=str, default=r"C:\Vkev\Repos\Region-Attention-Transformer-for-Medical-Image-Restoration\data\archive\train.csv",
@@ -541,6 +517,7 @@ def main():
         cls_weight=args.cls_weight,
         recon_weight=args.recon_weight,
         mlp_hidden=args.mlp_hidden,
+        mlp_dropout=args.mlp_dropout,
     )
     # Align example input shape with dataset
     try:
