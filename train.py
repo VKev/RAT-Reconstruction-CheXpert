@@ -94,6 +94,12 @@ class LitAutoModule(L.LightningModule):
         self._mask_cache: dict[tuple, torch.Tensor] = {}
 
     def _get_default_mask(self, batch_size: int, height: int, width: int, device: torch.device) -> torch.Tensor:
+        # Safety: ensure cache exists even if model was restored in a way that skipped __init__ assignments
+        if not hasattr(self, "_mask_cache") or self._mask_cache is None:
+            try:
+                self._mask_cache = {}
+            except Exception:
+                self.__dict__["_mask_cache"] = {}
         key = (device.type, int(getattr(device, 'index', -1) or -1), batch_size, height, width,
                int(getattr(self.hparams, "grid_h", 14)), int(getattr(self.hparams, "grid_w", 14)))
         m = self._mask_cache.get(key, None)
