@@ -315,8 +315,10 @@ class ClassificationAccEvalCallback(L.Callback):
         # Only valid for phase 2 with a classification head
         if not hasattr(pl_module, "phase") or int(getattr(pl_module, "phase", 1)) != 2:
             return None
-        if not hasattr(pl_module, "cls_head"):
-            return None
+        # Accept either attribute name
+        head = getattr(pl_module, "_cls_head", None)
+        if head is None:
+            head = getattr(pl_module, "cls_head", None)
         dm = trainer.datamodule
         if dm is None:
             return None
@@ -373,12 +375,30 @@ class ClassificationAccEvalCallback(L.Callback):
                     continue
                 labels = labels.to(device).float()
 
-                # Extract features from RAT middle
+                # Extract features from RAT; prefer pre+post concat if available
                 rat = getattr(pl_module.model, "rat", None)
-                if rat is None or not hasattr(rat, "extract_middle_features"):
+                if rat is None:
                     continue
-                feats = rat.extract_middle_features(x, mask)
-                logits = pl_module.cls_head(feats)
+                feats = None
+                if hasattr(rat, "extract_pre_post_features"):
+                    pre_f, post_f = rat.extract_pre_post_features(x, mask)
+                    feats = torch.cat([pre_f, post_f], dim=1)
+                elif hasattr(rat, "extract_middle_features"):
+                    feats = rat.extract_middle_features(x, mask)
+                else:
+                    continue
+                # Ensure head exists and matches channel count
+                if head is None:
+                    make_head = getattr(pl_module, "_make_cls_head", None)
+                    if callable(make_head):
+                        head = make_head(int(feats.size(1)), prefix="[eval]", device=device)
+                        try:
+                            pl_module._cls_head = head
+                        except Exception:
+                            pass
+                    else:
+                        return None
+                logits = head(feats)
                 probs = torch.sigmoid(logits)
                 preds = (probs > 0.5).float()
 

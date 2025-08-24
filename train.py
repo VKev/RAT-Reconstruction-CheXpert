@@ -412,6 +412,11 @@ def main():
     parser.add_argument("--wandb-project", type=str, default="RAT-Medical-Image-Restoration", help="W&B project name")
     parser.add_argument("--wandb-entity", type=str, default=None, help="W&B entity (team/user)")
     parser.add_argument("--wandb-run-name", type=str, default=None, help="W&B run name")
+    # Evaluation/test controls
+    parser.add_argument("--eval-cls-every-epoch", action="store_true",
+                        help="[Phase 2] Evaluate and print classification metrics during validation each epoch")
+    parser.add_argument("--run-test", action="store_true",
+                        help="Run trainer.test after training and print test metrics")
 
     args = parser.parse_args()
 
@@ -567,7 +572,7 @@ def main():
     ]
     if args.save_samples:
         callbacks.append(SavePredictionsCallback(out_dir=args.output_dir, num_samples=16))
-    if args.phase == 2:
+    if args.phase == 2 and args.eval_cls_every_epoch:
         callbacks.append(ClassificationAccEvalCallback(segments=10, max_eval_batches=50))
 
     # Optional W&B logger
@@ -609,6 +614,20 @@ def main():
     )
 
     trainer.fit(lit, datamodule=dm, ckpt_path=args.ckpt_path)
+
+    # Optionally run test phase and print metrics
+    if args.run_test:
+        try:
+            dm.setup("test")
+        except Exception:
+            pass
+        results = trainer.test(lit, datamodule=dm)
+        try:
+            print("[test] metrics:")
+            for i, res in enumerate(results):
+                print(f"  dataloader#{i}: {res}")
+        except Exception:
+            pass
 
     # Optional quick test to export a sample grid from the test split too
     if args.save_samples:
