@@ -61,6 +61,35 @@ class LitAutoModule(L.LightningModule):
             self._cls_head = None  # type: ignore[attr-defined]
             # Focal loss for imbalanced multi-label classification
             self.cls_loss = MultiLabelFocalLossWithLogits(alpha=0.25, gamma=2.0, reduction="mean")
+        
+        # Small debug module to print tensor shape after Flatten
+        class _PrintShape(nn.Module):
+            def __init__(self, prefix: str = ""):
+                super().__init__()
+                self.prefix = prefix
+            def forward(self, x: torch.Tensor) -> torch.Tensor:
+                try:
+                    print(f"{self.prefix} shape after Flatten: {tuple(x.shape)}")
+                except Exception:
+                    pass
+                return x
+        self._PrintShape = _PrintShape
+
+    def _make_cls_head(self, in_channels: int, prefix: str, device: torch.device) -> nn.Sequential:
+        # Build a 2-layer MLP head with activation and dropout; print shape after Flatten
+        head = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Flatten(),
+            self._PrintShape(prefix=prefix),
+            nn.Linear(in_channels, 256),
+            nn.GELU(),
+            nn.Dropout(self.mlp_dropout),
+            nn.Linear(256, 256),
+            nn.GELU(),
+            nn.Dropout(self.mlp_dropout),
+            nn.Linear(256, self.num_classes),
+        )
+        return head.to(device)
         # Cache for default grid masks per (device,b,h,w,grid_h,grid_w)
         self._mask_cache: dict[tuple, torch.Tensor] = {}
 
@@ -188,17 +217,7 @@ class LitAutoModule(L.LightningModule):
             # Build classification head on first use to match concatenated channel count (no LazyLinear)
             if getattr(self, "_cls_head", None) is None:
                 in_ch = int(features.size(1))
-                self._cls_head = nn.Sequential(
-                    nn.AdaptiveAvgPool2d(1),
-                    nn.Flatten(),
-                    nn.Linear(in_ch, 256),
-                    nn.GELU(),
-                    nn.Dropout(self.mlp_dropout),
-                    nn.Linear(256, 256),
-                    nn.GELU(),
-                    nn.Dropout(self.mlp_dropout),
-                    nn.Linear(256, self.num_classes),
-                ).to(features.device)
+                self._cls_head = self._make_cls_head(in_ch, prefix="[train]", device=features.device)
             logits = self._cls_head(features)
             if labels is None and isinstance(y, dict) and "labels" in y:
                 labels = y["labels"]
@@ -268,17 +287,7 @@ class LitAutoModule(L.LightningModule):
                 # Ensure head exists and matches channel count
                 if getattr(self, "_cls_head", None) is None:
                     in_ch = int(features.size(1))
-                    self._cls_head = nn.Sequential(
-                        nn.AdaptiveAvgPool2d(1),
-                        nn.Flatten(),
-                        nn.Linear(in_ch, 256),
-                        nn.GELU(),
-                        nn.Dropout(self.mlp_dropout),
-                        nn.Linear(256, 256),
-                        nn.GELU(),
-                        nn.Dropout(self.mlp_dropout),
-                        nn.Linear(256, self.num_classes),
-                    ).to(features.device)
+                    self._cls_head = self._make_cls_head(in_ch, prefix="[val]", device=features.device)
                 logits = self._cls_head(features)
                 if labels is None and isinstance(y, dict) and "labels" in y:
                     labels = y["labels"]
