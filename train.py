@@ -57,8 +57,18 @@ class LitAutoModule(L.LightningModule):
         self.mlp_hidden = int(mlp_hidden)
         self.mlp_dropout = float(mlp_dropout)
         if self.phase == 2:
-            # Classification head will be built dynamically on first batch based on input channels
-            self._cls_head = None  # type: ignore[attr-defined]
+            # Prefer a Lazy Linear-based head so optimizer includes its params before first batch
+            self._cls_head = nn.Sequential(
+                nn.AdaptiveAvgPool2d(1),
+                nn.Flatten(),
+                nn.LazyLinear(256),
+                nn.GELU(),
+                nn.Dropout(self.mlp_dropout),
+                nn.Linear(256, 256),
+                nn.GELU(),
+                nn.Dropout(self.mlp_dropout),
+                nn.Linear(256, self.num_classes),
+            )  # type: ignore[attr-defined]
             # Focal loss for imbalanced multi-label classification
             self.cls_loss = MultiLabelFocalLossWithLogits(alpha=0.25, gamma=2.0, reduction="mean")
 
@@ -206,8 +216,9 @@ class LitAutoModule(L.LightningModule):
             if features is None:
                 # Fallback: use reconstruction tensor as features (not ideal)
                 features = get_recon(out)
-            # Build classification head on first use to match concatenated channel count (no LazyLinear)
+            # Ensure classification head exists (created lazily in __init__ with LazyLinear)
             if getattr(self, "_cls_head", None) is None:
+                # Extremely defensive: fallback to non-lazy head if missing for any reason
                 in_ch = int(features.size(1))
                 self._cls_head = self._make_cls_head(in_ch, prefix="[train]", device=features.device)
             logits = self._cls_head(features)
