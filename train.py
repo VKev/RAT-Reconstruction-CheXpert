@@ -82,13 +82,13 @@ class LitAutoModule(L.LightningModule):
         head = nn.Sequential(
             nn.AdaptiveAvgPool2d(1),
             nn.Flatten(),
-            nn.Linear(in_channels, 256),
+            nn.Linear(in_channels, self.mlp_hidden),
             nn.GELU(),
             nn.Dropout(self.mlp_dropout),
-            nn.Linear(256, 256),
+            nn.Linear(self.mlp_hidden, self.mlp_hidden),
             nn.GELU(),
             nn.Dropout(self.mlp_dropout),
-            nn.Linear(256, self.num_classes),
+            nn.Linear(self.mlp_hidden, self.num_classes),
         )
         return head.to(device)
         # Cache for default grid masks per (device,b,h,w,grid_h,grid_w)
