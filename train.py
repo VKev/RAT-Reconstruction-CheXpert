@@ -63,16 +63,16 @@ class LitAutoModule(L.LightningModule):
             self._cls_head = nn.Sequential(
                 nn.AdaptiveAvgPool2d(1),
                 nn.Flatten(),
-                nn.LazyLinear(256),
+                nn.LazyLinear(mlp_hidden),
                 nn.GELU(),
                 nn.Dropout(self.mlp_dropout),
-                nn.Linear(256, 256),
+                nn.Linear(mlp_hidden, mlp_hidden),
                 nn.GELU(),
                 nn.Dropout(self.mlp_dropout),
-                nn.Linear(256, 256),
+                nn.Linear(mlp_hidden, mlp_hidden),
                 nn.GELU(),
                 nn.Dropout(self.mlp_dropout),
-                nn.Linear(256, self.num_classes),
+                nn.Linear(mlp_hidden, self.num_classes),
             )  # type: ignore[attr-defined]
             # Focal loss for imbalanced multi-label classification
             self.cls_loss = MultiLabelFocalLossWithLogits(alpha=0.25, gamma=2.0, reduction="mean")
