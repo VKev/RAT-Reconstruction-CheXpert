@@ -76,6 +76,8 @@ class LitAutoModule(L.LightningModule):
             )  # type: ignore[attr-defined]
             # Focal loss for imbalanced multi-label classification
             self.cls_loss = MultiLabelFocalLossWithLogits(alpha=0.25, gamma=2.0, reduction="mean")
+            # Optional pre-projection to adapt feature channels if head was materialized earlier
+            self._cls_preproj: nn.Conv2d | None = None
 
     def _make_cls_head(self, in_channels: int, prefix: str, device: torch.device) -> nn.Sequential:
         # Build a 2-layer MLP head with activation and dropout; print shape after Flatten
@@ -166,6 +168,48 @@ class LitAutoModule(L.LightningModule):
 
         self._log_both("loss/recon", rec, prog_bar_step=True, prog_bar_epoch=True)
         return total
+
+    def _maybe_preproject_features(self, features: torch.Tensor) -> torch.Tensor:
+        """Ensure feature channels match the first FC layer's expected in_features if already materialized.
+
+        If the head's first linear is lazy and uninitialized, no action is taken.
+        """
+        if getattr(self, "_cls_head", None) is None:
+            return features
+        # Find first Linear in head
+        first_fc: nn.Module | None = None
+        for m in self._cls_head:
+            if isinstance(m, (nn.LazyLinear, nn.Linear)):
+                first_fc = m
+                break
+        if first_fc is None:
+            return features
+        # If LazyLinear and still uninitialized, skip projection to let it infer
+        if isinstance(first_fc, nn.LazyLinear):
+            try:
+                # If params are still uninitialized, do nothing
+                from torch.nn.modules.lazy import LazyModuleMixin  # type: ignore
+                if isinstance(first_fc, LazyModuleMixin) and first_fc.has_uninitialized_params():
+                    return features
+            except Exception:
+                return features
+        # At this point, we expect a materialized nn.Linear
+        if isinstance(first_fc, nn.Linear):
+            expected_in = int(first_fc.in_features)
+            # If 4D, adapt channels; keep spatial so head's own pool works
+            if features.dim() == 4:
+                cur_c = int(features.size(1))
+                if cur_c != expected_in:
+                    if self._cls_preproj is None or self._cls_preproj.in_channels != cur_c or self._cls_preproj.out_channels != expected_in:
+                        self._cls_preproj = nn.Conv2d(cur_c, expected_in, kernel_size=1, bias=False).to(features.device)
+                    features = self._cls_preproj(features)
+            elif features.dim() == 2:
+                cur_c = int(features.size(1))
+                if cur_c != expected_in:
+                    # Project vector features when rare
+                    proj = nn.Linear(cur_c, expected_in, bias=False).to(features.device)
+                    features = proj(features)
+        return features
 
     def _compute_recon_loss_per_sample(self, x: torch.Tensor, out, mask_for_loss: torch.Tensor | None = None) -> torch.Tensor:
         """Return per-sample reconstruction loss vector [B].
@@ -277,6 +321,8 @@ class LitAutoModule(L.LightningModule):
                 # Extremely defensive: fallback to non-lazy head if missing for any reason
                 in_ch = int(features.size(1))
                 self._cls_head = self._make_cls_head(in_ch, prefix="[train]", device=features.device)
+            # Adapt channels if head already materialized with different expected input size
+            features = self._maybe_preproject_features(features)
             logits = self._cls_head(features)
             if labels is None and isinstance(y, dict) and "labels" in y:
                 labels = y["labels"]
@@ -368,6 +414,7 @@ class LitAutoModule(L.LightningModule):
                 if getattr(self, "_cls_head", None) is None:
                     in_ch = int(features.size(1))
                     self._cls_head = self._make_cls_head(in_ch, prefix="[val]", device=features.device)
+                features = self._maybe_preproject_features(features)
                 logits = self._cls_head(features)
                 if labels is None and isinstance(y, dict) and "labels" in y:
                     labels = y["labels"]
