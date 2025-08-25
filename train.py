@@ -56,12 +56,17 @@ class LitAutoModule(L.LightningModule):
         self.recon_weight = float(recon_weight)
         self.mlp_hidden = int(mlp_hidden)
         self.mlp_dropout = float(mlp_dropout)
+        # Cache support devices column index when available (CheXpert)
+        self._support_idx: int | None = None
         if self.phase == 2:
             # Prefer a Lazy Linear-based head so optimizer includes its params before first batch
             self._cls_head = nn.Sequential(
                 nn.AdaptiveAvgPool2d(1),
                 nn.Flatten(),
                 nn.LazyLinear(256),
+                nn.GELU(),
+                nn.Dropout(self.mlp_dropout),
+                nn.Linear(256, 256),
                 nn.GELU(),
                 nn.Dropout(self.mlp_dropout),
                 nn.Linear(256, 256),
@@ -162,6 +167,57 @@ class LitAutoModule(L.LightningModule):
         self._log_both("loss/recon", rec, prog_bar_step=True, prog_bar_epoch=True)
         return total
 
+    def _compute_recon_loss_per_sample(self, x: torch.Tensor, out, mask_for_loss: torch.Tensor | None = None) -> torch.Tensor:
+        """Return per-sample reconstruction loss vector [B].
+
+        Uses the selected reconstruction criterion when feasible; falls back to MSE for unknown ones.
+        """
+        recon = get_recon(out)
+        if isinstance(self.crit, FocalRegionLoss):
+            # Ensure mask exists at input resolution
+            if mask_for_loss is None and bool(getattr(self.hparams, "use_default_grid_mask", True)):
+                b, _, hh, ww = x.shape
+                mask_for_loss = generate_region_mask(
+                    b, hh, ww,
+                    grid_h=int(getattr(self.hparams, "grid_h", 14)),
+                    grid_w=int(getattr(self.hparams, "grid_w", 14)),
+                    device=x.device,
+                )
+            losses = []
+            for b in range(x.size(0)):
+                losses.append(self.crit(recon[b:b+1], x[b:b+1], mask_for_loss[b:b+1]))
+            return torch.stack(losses, dim=0).view(-1)
+        # Common pixel losses per-sample
+        try:
+            if isinstance(self.crit, nn.MSELoss):
+                return F.mse_loss(recon, x, reduction="none").mean(dim=(1, 2, 3))
+            if isinstance(self.crit, nn.L1Loss):
+                return F.l1_loss(recon, x, reduction="none").mean(dim=(1, 2, 3))
+            if isinstance(self.crit, nn.BCEWithLogitsLoss):
+                return F.binary_cross_entropy_with_logits(recon, x, reduction="none").mean(dim=(1, 2, 3))
+        except Exception:
+            pass
+        # Fallback to MSE
+        return F.mse_loss(recon, x, reduction="none").mean(dim=(1, 2, 3))
+
+    def _resolve_support_device_index(self) -> int | None:
+        """Best-effort to find the index of 'Support Devices' from the attached datamodule.
+        Returns None if not found, in which case we will fall back to last column.
+        """
+        if self._support_idx is not None:
+            return self._support_idx
+        try:
+            dm = getattr(self, "trainer", None)
+            dm = getattr(dm, "datamodule", None)
+            train_set = getattr(dm, "train_set", None) if dm is not None else None
+            idx_map = getattr(train_set, "labels_index_map", None)
+            if isinstance(idx_map, dict) and ("Support Devices" in idx_map):
+                self._support_idx = int(idx_map["Support Devices"])  # cache
+                return self._support_idx
+        except Exception:
+            pass
+        return None
+
     def training_step(self, batch, batch_idx):
         x, y = batch
         x_in = x
@@ -196,7 +252,7 @@ class LitAutoModule(L.LightningModule):
                     mask = None
 
         out = self(x_in, mask=mask)
-        # Reconstruction loss as before (rec)
+        # Reconstruction loss
         loss_recon = self._compute_loss(x, out, mask_for_loss=mask)
         total = loss_recon if self.phase == 1 else torch.tensor(0.0, device=x.device)
 
@@ -243,8 +299,29 @@ class LitAutoModule(L.LightningModule):
                     labels = torch.cat([labels, pad], dim=1)
             loss_cls = self.cls_loss(logits, labels)
             self._log_both("loss/cls", loss_cls, prog_bar_step=True, prog_bar_epoch=True)
-            # Weighted combination for phase 2
-            total = self.recon_weight * loss_recon + self.cls_weight * loss_cls
+            # New loss formula with SSIM attention and Support Devices indicator per-sample
+            from utils import ssim_tensor
+            recon = get_recon(out).clamp(0, 1)
+            # Per-sample reconstruction loss
+            rec_per = self._compute_recon_loss_per_sample(x, out, mask_for_loss=mask)  # [B]
+            # Per-sample SSIM in [-1,1] -> attention in [0,1]
+            ssim_vec = ssim_tensor(recon, x.clamp(0, 1), size_average=False)  # [B]
+            ssim_att = (ssim_vec + 1.0) / 2.0
+            # Per-sample y for Support Devices
+            support_idx = self._resolve_support_device_index()
+            if support_idx is not None and support_idx < labels.shape[1]:
+                y_vec = labels[:, support_idx]
+            else:
+                # Fallback: use last column
+                y_vec = labels[:, -1]
+            y_vec = y_vec.float().clamp(0, 1).view(-1)
+            # Core term per-sample
+            core = (((1.0 - y_vec) * rec_per) + 1.0) / ((y_vec * rec_per * ssim_att) + 1.0)
+            # Total loss: mean over batch + classification focal loss
+            total = core.mean() + loss_cls
+            # Log helpful stats
+            self._log_both("loss/recon", rec_per.mean(), prog_bar_step=True, prog_bar_epoch=True)
+            self._log_both("metric/ssim_att", ssim_att.mean(), prog_bar_step=False, prog_bar_epoch=True)
 
         self._log_both("loss/train", total, prog_bar_step=True, prog_bar_epoch=True)
         return total
@@ -309,7 +386,20 @@ class LitAutoModule(L.LightningModule):
                         labels = torch.cat([labels, pad], dim=1)
                 loss_cls = self.cls_loss(logits, labels)
                 self._log_both("loss/cls_val", loss_cls, prog_bar_step=False, prog_bar_epoch=True)
-                total = self.recon_weight * loss_recon + self.cls_weight * loss_cls
+                # New validation loss formula (same as train) without weights
+                from utils import ssim_tensor
+                recon = get_recon(out).clamp(0, 1)
+                rec_per = self._compute_recon_loss_per_sample(x, out, mask_for_loss=mask)
+                ssim_vec = ssim_tensor(recon, x.clamp(0, 1), size_average=False)
+                ssim_att = (ssim_vec + 1.0) / 2.0
+                support_idx = self._resolve_support_device_index()
+                if support_idx is not None and support_idx < labels.shape[1]:
+                    y_vec = labels[:, support_idx]
+                else:
+                    y_vec = labels[:, -1]
+                y_vec = y_vec.float().clamp(0, 1).view(-1)
+                core = (((1.0 - y_vec) * rec_per) + 1.0) / ((y_vec * rec_per * ssim_att) + 1.0)
+                total = core.mean() + loss_cls
             except Exception:
                 pass
 
@@ -564,15 +654,11 @@ def main():
                 print(f"[phase2] Loaded RAT weights from {args.phase2_ckpt}")
             except Exception as e:
                 print(f"[phase2] Failed to load RAT weights from {args.phase2_ckpt}: {e}")
-        # Freeze decoder, keep encoder+middle blocks trainable
+        # Freeze decoder path only; keep intro/encoders/downs/middle/ending trainable
         for p in base_model.rat.decoders.parameters():
             p.requires_grad = False
         for p in base_model.rat.ups.parameters():
             p.requires_grad = False
-        for p in base_model.rat.ending.parameters():
-            p.requires_grad = False
-        # Keep intro, encoders, downs, middle_blks, ending trainable
-        # (ending is small conv producing reconstruction; keep it to allow recon loss)
 
     # Callbacks
     callbacks = [
